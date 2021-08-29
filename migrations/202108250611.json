@@ -1,0 +1,6 @@
+{
+    "name": "add column md5 to archives",
+    "up": "alter table archives add column md5 char(32)",
+    "down": "BEGIN; CREATE TABLE archives_temp as select id, target_id, created_at, size_kb, is_remote, remote_push_at from archives; DROP TABLE archives; ALTER TABLE archives_temp RENAME TO archives; END TRANSACTION;"
+  }
+  

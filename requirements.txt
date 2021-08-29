@@ -1,0 +1,4 @@
+pysqlite3-binary
+PyGnuplot
+boto3
+pytz

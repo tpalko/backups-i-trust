@@ -1,0 +1,6 @@
+{
+    "name": "add columns push_strategy and push_period to targets",
+    "up": "alter table targets add column push_strategy char(32); alter table targets add column push_period int",
+    "down": "BEGIN; CREATE TABLE targets_temp as select id, path, name, excludes, budget_max, schedule from targets; DROP TABLE targets; ALTER TABLE targets_temp RENAME TO targets; END TRANSACTION;"
+  }
+  
