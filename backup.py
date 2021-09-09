@@ -21,7 +21,6 @@ from pytz import timezone
 import subprocess 
 
 UTC = timezone('UTC')
-now = UTC.localize(datetime.now())
 
 REMOTE_STORAGE_COST_GB_PER_MONTH = 0.00099
 DATABASE_FILE = 'backups.db'
@@ -51,29 +50,36 @@ COLOR_TABLE = {
     'white': '255;255;255',
     'red': '255;0;0',
     'green': '0;255;0',
-    'orange': '255;165;0'
+    'orange': '255;165;0',
+    'gray': '192;192;192'
 }
 
 def colorwrapper(text, color):
     return f'{FOREGROUND_COLOR_PREFIX}{COLOR_TABLE[color]}{FOREGROUND_COLOR_SUFFIX}{text}{FOREGROUND_COLOR_RESET}'
 
+def flushprint(text):
+    print(text, flush=True)
+
 def printwhite(text):
-    print(colorwrapper(text, 'white'))
+    flushprint(colorwrapper(text, 'white'))
 
 def printred(text):
-    print(colorwrapper(text, 'red'))
+    flushprint(colorwrapper(text, 'red'))
 
 def printgreen(text):
-    print(colorwrapper(text, 'green'))
+    flushprint(colorwrapper(text, 'green'))
 
 def printorange(text):
-    print(colorwrapper(text, 'orange'))
+    flushprint(colorwrapper(text, 'orange'))
 
-def human(value):
+def printgray(text):
+    flushprint(colorwrapper(text, 'gray'))
+
+def human(value, initial_units='b'):
     return_val = value 
-    units = [ 'kb', 'mb', 'gb', 'tb', 'pb' ]
-    unit_index = 0
-    if type(value).__name__ == 'int' or value.isnumeric():
+    units = [ 'b', 'kb', 'mb', 'gb', 'tb', 'pb' ]    
+    unit_index = units.index(initial_units)
+    if type(value).__name__ in ['int', 'float'] or value.isnumeric():
         while value >= 1024:
             value = value / 1024.0
             unit_index += 1
@@ -81,27 +87,71 @@ def human(value):
     
     return return_val
 
-def column(table):
+class Columnizer(object):
 
-    row_lengths = set([ len(table[i]) for i in range(len(table)) ])
-    if len(row_lengths) > 1:
-        # -- not every row has the same number of columns
-        pass 
-    
-    val_widths = []
-    col_max_widths = {}
-    for rix, row in enumerate(table):
-        for cix, col in table[rix]:
-            val_widths[rix][cix] = len(table[rix][cix])
-    col_max_widths = [ max(r) for r in val_widths ]
+    tabs = None 
+    cell_padding = None 
+    alignment = None 
+    header_color = None 
+    row_color = None 
+    cell_padding_default = 5
+    header_color_default = 'white'
+    row_color_default = 'orange'
 
-    for c, max_width in enumerate(col_max_widths):
-        while max_width % 4 != 0:
-            max_width += 1
-        for row in table:
-            printval = row[c]
-            while len(printval) < max_width:
-                printval += '\t'
+    def __init__(self, *args, **kwargs):
+        for k in kwargs:
+            self.__setattr__(k, kwargs[k])
+        if not self.cell_padding:
+            self.cell_padding = self.cell_padding_default
+        if not self.header_color:
+            self.header_color = self.header_color_default
+        if not self.row_color:
+            self.row_color = self.row_color_default
+
+    def pad_tabs(self, data):
+
+        if not self.tabs and len(data) > 0:
+            self.tabs = [ 1 for c in data[0] ]
+
+        for rix, row in enumerate(data):
+            for cix, col in enumerate(data[rix][0:-1]):
+                curr_tab = self.tabs[cix+1] - self.tabs[cix]
+                cell_value = str(data[rix][cix])
+                cell_width = len(cell_value)
+                extra = cell_width + self.cell_padding - curr_tab
+                self.tabs = [ m + extra if (i >= cix+1 and extra > 0) else m for i,m in enumerate(self.tabs) ]
+
+    def align_spaces(self, value, cell_width, alignment):
+        if alignment == 'r':
+            return f'{"".join([ " " for i in range(cell_width - self.cell_padding - len(value)) ])}{value}'
+        return value
+
+    def align_table(self, data):
+        return [ [ self.align_spaces(str(r), cell_width=self.tabs[i+1] - self.tabs[i], alignment=self.alignment[i]) if i < len(row) - 1 else str(r) for i,r in enumerate(row) ] for row in data ]
+
+    def assemble_table_print(self, table, color):
+        tabs_cmd = f'tabs {",".join([ str(c) for c in self.tabs ])}'
+        tab_reset = "tabs -8"
+        print_data = "\n\"; printf \"".join([ colorwrapper("\t".join([ str(v) for v in row ]), color) for row in table ])
+        return "%s; printf \"%s\n\"; %s;" % (tabs_cmd, print_data, tab_reset)
+        
+    def print(self, table, header):
+        if header:
+            self.pad_tabs([header])
+        self.pad_tabs(table)
+
+        printout = ""
+        if header:
+            header = [header]
+            if self.alignment:
+                header = self.align_table(header)
+            printout += self.assemble_table_print(header, self.header_color)
+        
+        if self.alignment:
+            table = self.align_table(table)
+        printout += self.assemble_table_print(table, self.row_color)
+
+        subprocess.run(printout, shell=True)
 
 
 #####################
@@ -189,6 +239,7 @@ def initialize_database():
 
 ARCHIVE_TARGET_JOIN_SELECT = 'a.id, a.target_id, a.created_at, a.size_kb, a.is_remote, a.remote_push_at, a.filename, a.returncode, a.errors, a.pre_marker_timestamp, a.md5, t.name, t.path'
 ARCHIVE_TARGET_JOIN = 'from archives a inner join targets t on t.id = a.target_id'
+TARGETS_SELECT = 't.id, t.path, t.name, t.excludes, t.budget_max, t.schedule, t.push_strategy, t.push_period'
 
 def get_archive_for_pre_timestamp(target_id, timestamp):
     db = Database()
@@ -206,7 +257,7 @@ def get_last_archive(target_id):
         line = c.fetchone()
     return line
 
-def get_archives(target_name=None):
+def get_archives(target_name=None, with_location=False):
 
     target = None 
     if target_name:
@@ -214,6 +265,7 @@ def get_archives(target_name=None):
 
     db_records = []
     db = Database()
+
     with db.cursor() as c:
         if target:
             c.execute(f'select {ARCHIVE_TARGET_JOIN_SELECT} {ARCHIVE_TARGET_JOIN} where a.target_id = ? order by created_at desc', (target['id'],))
@@ -221,6 +273,11 @@ def get_archives(target_name=None):
             c.execute(f'select {ARCHIVE_TARGET_JOIN_SELECT} {ARCHIVE_TARGET_JOIN} order by created_at desc')
         db_records = c.fetchall()
     
+    if with_location:
+        s3_objects = get_remote_archives(bucket_name)
+        s3_objects_by_filename = { os.path.basename(obj.key): obj for obj in s3_objects }    
+        for record in db_records:
+            record['location'] = get_archive_location(record, s3_objects_by_filename)
     return db_records
 
 def delete_archive(archive_id):
@@ -256,7 +313,7 @@ def get_targets():
     db = Database()
     all_targets = None 
     with db.cursor() as c:
-        c.execute('select * from targets')
+        c.execute(f'select {TARGETS_SELECT} from targets t')
         all_targets = c.fetchall()
     return all_targets        
 
@@ -264,7 +321,7 @@ def get_target(name):
     db = Database()
     line = None 
     with db.cursor() as c:
-        c.execute('select id, path, name, excludes, budget_max, schedule from targets where name = ?', (name,))
+        c.execute(f'select {TARGETS_SELECT} from targets t where t.name = ?', (name,))
         line = c.fetchone()
     return line
 
@@ -303,15 +360,64 @@ def get_archive_stats(target_name):
     pass 
 
 def print_targets():
+
+    '''
+    for each target:
+        how many cycles behind is it?
+        are there files not backed up?
+        are there archives not pushed? (implies there are files not pushed)
+        monthly cost in s3?
+    '''
+
     # -- target name, path, budget max, schedule, total archive count, % archives remote, last archive date/days, next archive date/days
     targets = get_targets()
+    archives = get_archives(with_location=True)
+    remote_stats = get_remote_stats(targets)
 
-    printwhite(f'name\tpath\tbudget_max\tschedule\tarchive_count')
+    now = datetime.now()
+
     for target in targets:
-        archives = get_archives(target["name"])
-        printorange(f'{target["name"]}\t{target["path"]}\t{target["budget_max"]}\t{target["schedule"]}\t{len(archives)}')
+        target['has_new_files'] = target_has_new_files(target, log=False)
+        target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target['id'] }
+        if len(target_archives_by_created_at) == 0:
+            target['cycles_behind'] = -1
+            target['last_archive_pushed'] = 'n/a'
+            continue 
+        last_archive_created_at = max(target_archives_by_created_at.keys())
+        last_archive = target_archives_by_created_at[last_archive_created_at]
+        target['cycles_behind'] = math.floor(int(target['schedule']) / ((now - last_archive['created_at']).total_seconds() / 60.0))        
+        target['last_archive_pushed'] = last_archive['is_remote']
+        
+        push_due = is_push_due(target, remote_stats=remote_stats, print=False)
+        target['would_push'] = push_due and (not target['last_archive_pushed'] or target['has_new_files'])
 
-def get_archive_location(archive, remote_file_map):
+    archives_by_target_and_location = { t['id']: {'local': [], 'remote': []} for t in targets }
+    for archive in archives:
+        if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
+            archives_by_target_and_location[archive['target_id']]['local'].append(archive)
+        if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.REMOTE_ONLY ]:
+            archives_by_target_and_location[archive['target_id']]['remote'].append(archive)
+
+    header = ['name', 'path', 'schedule', 'push_strategy', 'push_period', 'budget_max', 'local_archives', 'remote_archives', 'cycles behind', 'new_files', 'would_push']
+    table = [ [ 
+            target['name'], 
+            target['path'],
+            target['schedule'], 
+            target['push_strategy'], 
+            target['push_period'], 
+            target['budget_max'], 
+            len(archives_by_target_and_location[target['id']]['local']), 
+            len(archives_by_target_and_location[target['id']]['remote']), 
+            target['cycles_behind'], 
+            target['has_new_files'], 
+            target['would_push']
+        ] for target in targets 
+    ]
+
+    c = Columnizer()
+    c.print(table, header)
+
+def get_archive_location(archive, remote_file_map={}):
     basename = os.path.basename(archive['filename'])
     local_file_exists = os.path.exists(archive['filename'])
     remote_file_exists = basename in remote_file_map
@@ -324,50 +430,49 @@ def get_archive_location(archive, remote_file_map):
         return Location.REMOTE_ONLY
     return Location.DOES_NOT_EXIST
 
-def print_archives(target_name=None, print_headers=True):
+def get_object_storage_cost_per_month(obj):
+    return REMOTE_STORAGE_COST_GB_PER_MONTH*(obj.size / (1024 ** 3))
+
+def print_archives(target_name):
 
     db_records = get_archives(target_name)
 
-    s3_objects = []
-    with archivebucket() as bucket:
-        # TODO: improve the matching here 
-        s3_objects = [ obj for obj in bucket.objects.all() if (target_name and obj.key.find(f'{target_name}_') == 0) or not target_name ]
-    s3_objects_by_filename = { obj.key: obj for obj in s3_objects }    
+    s3_objects = get_remote_archives(bucket_name, target_name)
+    s3_objects_by_filename = { os.path.basename(obj.key): obj for obj in s3_objects }    
 
     archive_display = []
 
     for db_record in db_records:
 
-        basename = os.path.basename(db_record['filename'])
-
+        db_record['size_mb'] = "%.1f" % (db_record['size_kb'] / 1024.0)
         db_record['location'] = get_archive_location(db_record, s3_objects_by_filename)    
 
-        db_record['s3_cost_per_month'] = "%.2f" % 0.00
-        if basename in s3_objects_by_filename:
-            db_record['s3_cost_per_month'] = "%.2f" % (REMOTE_STORAGE_COST_GB_PER_MONTH*(s3_objects_by_filename[basename].size / (1024.0*1024.0*1024.0)))
+        basename = os.path.basename(db_record['filename'])
 
-        db_record['size_mb'] = "%.1f" % (db_record['size_kb'] / 1024.0)
+        db_record['s3_cost_per_month'] = "%.4f" % 0.00
+        if basename in s3_objects_by_filename:
+            db_record['s3_cost_per_month'] = "%.4f" % get_object_storage_cost_per_month(s3_objects_by_filename[basename])
         
         archive_display.append(db_record)
+
         if basename in s3_objects_by_filename:
             del s3_objects_by_filename[basename]
     
     for orphaned_s3_object_filename in s3_objects_by_filename:
         obj = s3_objects_by_filename[orphaned_s3_object_filename]
 
-        archive_display.append({ 'id': None, 'filename': obj.key, 'created_at': obj.last_modified, 'size_mb': "%.1f" % (obj.size/(1024.0*1024.0)), 'location': 'remote only', 's3_cost_per_month': "%.2f" % (REMOTE_STORAGE_COST_GB_PER_MONTH*(obj.size / (1024.0*1024.0*1024.0))) })
+        archive_display.append({ 'id': None, 'filename': obj.key, 'created_at': obj.last_modified, 'size_mb': "%.1f" % (obj.size/(1024.0*1024.0)), 'location': Location.REMOTE_ONLY, 's3_cost_per_month': "%.4f" % get_object_storage_cost_per_month(obj) })
     
     #total_cost = sum([ float(a['s3_cost_per_month'])  for a in archive_display ])
     
-    if print_headers:
-        if len(archive_display) > 0:
-            printwhite(f'id\tfilename\t\t\t\t\tcreated_at\t\t\tsize_mb\tlocation\t$/month')
-        else:
-            printorange(f'No archives found for target.')
+    if len(archive_display) == 0:
+        printorange(f'No archives found for target.')
+    else:
+        table = [ [ archive["id"], archive["filename"], archive["created_at"], archive["size_mb"], archive["location"], archive["s3_cost_per_month"] ] for archive in archive_display ]
+        header = ['id','filename','created_at','size_mb','location','$/month']
 
-    for archive in archive_display:
-        # id, filename, created_at, size_mb, is_remote, location
-        printorange(f'{archive["id"]}\t{archive["filename"]}\t{archive["created_at"]}\t{archive["size_mb"]}\t\t{archive["location"]}\t\t\t{archive["s3_cost_per_month"]}')
+        c = Columnizer(cell_padding=5, alignment=['l', 'r', 'l', 'r', 'l', 'r'], header_color='white', row_color='orange')
+        c.print(table, header)
 
 
 #################
@@ -375,48 +480,69 @@ def print_archives(target_name=None, print_headers=True):
 # aws
 
 @contextmanager
-def archivebucket():
+def archivebucket(bucket_name):
     s3 = boto3.resource('s3')
-    archive_bucket = s3.Bucket('frankenarchive')
-    yield archive_bucket
+    archive_bucket = s3.Bucket(bucket_name)
+    printorange(f'S3 bucket yield out')
+    time_out = datetime.now()    
+    yield archive_bucket    
+    time_in = datetime.now()
+    printorange(f'S3 bucket yield in')
+    printorange(f'S3 bucket calculation time: {"%.1f" % (time_in - time_out).total_seconds()} seconds')
 
-def is_push_due(target):
+def is_push_due(target, remote_stats=None, print=True):
     
     archives = get_archives(target['name'])
     push_due = False 
     message = 'No calculation was performed to determine push eligibility. The default is no.'
+    minutes_since_last_object = None 
 
-    objs = get_remote_archives(target['name'])
-    objs_by_last_modified = { obj.last_modified: obj for obj in objs }
-    last_modified = max(objs_by_last_modified.keys())
-    now = UTC.localize(datetime.utcnow())
-    since_last_remote_object = now - last_modified
-    minutes_since_last_object = (since_last_remote_object.total_seconds()*1.0) / 60
-    
-    if target['push_strategy'] == Strategy.BUDGET_PRIORITY:
+    if not remote_stats:
+        remote_stats = get_remote_stats([target])
 
-        average_size = 0
-        max_s3_objects = 0
-        if len(archives) > 0:
-            average_size = sum([ a['size_kb'] / (1024.0*1024.0) for a in archives ]) / len(archives)
-        else:
-            average_size = get_target_uncompressed_size_kb(target) / (1024.0*1024.0)
-        lifetime_cost = average_size * REMOTE_STORAGE_COST_GB_PER_MONTH * 6
-        max_s3_objects = math.floor(target['budget_max'] / lifetime_cost)
-        minutes_per_push = (180.0*24*60) / max_s3_objects
+    last_modified = remote_stats[target['name']]['max_last_modified']
+    current_s3_objects = remote_stats[target['name']]['count']
 
-        push_due = minutes_since_last_object > minutes_per_push
-        message = f'Given a calculated size of {average_size} GB and a budget of ${target["budget_max"]}, a push can be accepted every {minutes_per_push} minutes and it has been {minutes_since_last_object} minutes'
-    
-    elif target['push_strategy'] == Strategy.SCHEDULE_PRIORITY:
-        
-        push_due = minutes_since_last_object > target['push_period']
-        message = f'The push period is {target["push_period"]} minutes and it has been {minutes_since_last_object} minutes'
-
-    if push_due:
-        printwhite(message)
+    if last_modified:
+        now = UTC.localize(datetime.utcnow())
+        since_last_remote_object = now - last_modified
+        minutes_since_last_object = (since_last_remote_object.total_seconds()*1.0) / 60
     else:
-        printorange(message)
+        push_due = True 
+        message = 'No remote objects were found, this may be the first?'
+    
+    if minutes_since_last_object:
+
+        if target['push_strategy'] == Strategy.BUDGET_PRIORITY.value:
+
+            average_size = 0
+            max_s3_objects = 0
+            if len(archives) > 0:
+                average_size = sum([ a['size_kb'] / (1024.0*1024.0) for a in archives ]) / len(archives)
+            else:
+                average_size = get_target_uncompressed_size_kb(target) / (1024.0*1024.0)
+            lifetime_cost = average_size * REMOTE_STORAGE_COST_GB_PER_MONTH * 6
+            max_s3_objects = math.floor(target['budget_max'] / lifetime_cost)
+            if max_s3_objects == 0:
+                message = f'One archive has a lifetime cost of {lifetime_cost}. At a max budget of {target["budget_max"]}, no archives can be stored in S3'
+            else:
+                minutes_per_push = (180.0*24*60) / max_s3_objects
+                push_due = current_s3_objects < max_s3_objects and minutes_since_last_object > minutes_per_push
+                message = f'Given a calculated size of {average_size} GB and a budget of ${target["budget_max"]}, a push can be accepted every {minutes_per_push} minutes for max {max_s3_objects} objects. It has been {minutes_since_last_object} minutes and there are {current_s3_objects} objects.'
+        
+        elif target['push_strategy'] == Strategy.SCHEDULE_PRIORITY.value:
+            
+            push_due = minutes_since_last_object > target['push_period']
+            message = f'The push period is {target["push_period"]} minutes and it has been {minutes_since_last_object} minutes'
+        
+        else:
+            message = f'No identifiable push strategy ({target["push_strategy"]}) has been defined for {target["name"]}.'
+
+    if print:
+        if push_due:
+            printwhite(message)
+        else:
+            printorange(message)
 
     return push_due
 
@@ -445,27 +571,64 @@ def get_archive_bytes(filename):
         b = f.read()
     return b
 
-def push_archive_to_bucket(archive):
-    # print(archive)
+def push_archive_to_bucket(archive, bucket_name):
+    printgreen(f'Pushing {archive["filename"]} ({human(archive["size_kb"], "kb")})')
     object = None 
-    with archivebucket() as bucket:
+    with archivebucket(bucket_name) as bucket:
         b64_md5 = base64.b64encode(bytes(archive['md5'], 'utf-8')).decode()
         # printwhite(f'{b64_md5}')
-        object = bucket.put_object(
-            Body=get_archive_bytes(archive['filename']),
-            #ContentMD5=b64_md5,
-            Key=os.path.basename(archive['filename'])
-        )
+        
+        method = 'upload_file'
+        #method = 'put_object'
+
+        key = f'{archive["name"]}/{os.path.basename(archive["filename"])}'
+        if method == 'upload_file':
+            from boto3.s3.transfer import TransferConfig
+            uploadconfig = TransferConfig(multipart_threshold=4*1024*1024*1024)
+            object = bucket.upload_file(archive['filename'], key, Config=uploadconfig)
+        elif method == 'put_object':
+            object = bucket.put_object(
+                Body=get_archive_bytes(archive['filename']),
+                #ContentLength=int(archive['size_kb']*1024),
+                #ContentMD5=b64_md5,
+                Key=key
+            )
     return object
 
-def get_remote_archives(target_name):
-        
-    S3_BACKUP_BUCKET = 'frankenback'
-    S3_ARCHIVE_BUCKET = 'frankenarchive'
-    WORKING_FOLDER = 'tmp'
-    SKIP_COPY = 0
-    SKIP_ARCHIVE = 0
+def delete_objects(objs, bucket_name):
+    with archivebucket(bucket_name) as bucket:
+        delete_resp = bucket.delete_objects(
+            Delete={
+                'Objects': [ { 'Key': obj.key } for obj in objs ],
+                'Quiet': False
+            }
+        )
+        if len(delete_resp['Errors']) > 0:
+            printred(f'Delete errors: {",".join([ "%s: %s" % (o["Key"], o["Code"], o["Message"]) for o in delete_resp["Errors"] ])}')
+        else:
+            printgreen(f'Delete confirmed: {",".join([ o["Key"] for o in delete_resp["Deleted"] ])}')
 
+def object_is_target(obj, target_name):
+    return (obj.key.find(f'{target_name}/{target_name}_') == 0 or obj.key.find(f'{target_name}_') == 0)
+
+def get_remote_stats(targets):
+    s3_objects = get_remote_archives(bucket_name)
+    remote_stats = {}
+    for target in targets:        
+        archives_by_last_modified = { obj.last_modified: obj for obj in s3_objects if object_is_target(obj, target['name']) }
+        now = UTC.localize(datetime.utcnow())
+        aged = [ archives_by_last_modified[last_modified] for last_modified in archives_by_last_modified if (now - last_modified).total_seconds() / (60*60*24) >= 180 ]
+        current_count = [ last_modified for last_modified in archives_by_last_modified if (now - last_modified).total_seconds() / (60*60*24) < 180 ]
+        remote_stats[target['name']] = { 
+            'max_last_modified': max(archives_by_last_modified.keys()) if len(archives_by_last_modified.keys()) > 0 else None, 
+            'count': len(archives_by_last_modified),
+            'aged': aged,
+            'current_count': current_count
+        }
+    return remote_stats 
+
+def get_remote_archives(bucket_name, target_name=None):
+        
     # my_config = Config(
     #   region_name = 'us-east-1',
     #   signature_version = 's3v4',
@@ -479,23 +642,25 @@ def get_remote_archives(target_name):
     # buckets_response = client.list_buckets()
     # buckets = [ bucket['Name'] for bucket in buckets_response['Buckets'] ]
     # print(f'buckets: {buckets}')
-    # print(f'frankenarchive objects (via client): {client.list_objects(Bucket="frankenarchive")}')
 
     objects = []
     #print(dir(archive_bucket.objects))
     #print(dir(archive_bucket.objects.all()))
-    with archivebucket() as bucket:
-        objects = [ obj for obj in bucket.objects.all() if obj.key.find(f'{target_name}_') == 0 ]
+
+    # TODO: improve the matching here 
+    with archivebucket(bucket_name) as bucket:
+        all_objects = bucket.objects.all()
+        objects = [ obj for obj in all_objects if (target_name and object_is_target(obj, target_name)) or not target_name ]
     return objects 
 
-def cleanup_remote_archives(dry_run=True):
-    now = UTC.localize(datetime.utcnow())
-    aged_out = []
-    for obj in s3_objects:
-        print(f'subtracting {datetime.strftime(now, "%Y-%m-%d %H:%M:%S")} {now.tzinfo} and {datetime.strftime(obj.last_modified, "%Y-%m-%d %H:%M:%S")} {obj.last_modified.tzinfo}')
-        days_old = (now - obj.last_modified).total_seconds() / (60*60*24)
-        if days_old >= 180:
-            aged_out.append(obj.key)
+def cleanup_remote_archives(bucket_name, remote_stats, dry_run=True):
+    if remote_stats['current_count'] > 0:
+        printorange(f'Deleting remote archives aged out: {",".join([ obj.key for obj in remote_stats["aged"] ])}')
+        if dry_run:
+            printred(f'DRY RUN -- skipping remote deletion')
+        else:
+            delete_objects(remote_stats["aged"], bucket_name)
+
 
 #################
 #
@@ -507,6 +672,8 @@ def get_working_folder_free_space():
 
 def get_target_uncompressed_size_kb(target):
 
+    # TODO: use target excludes to more accurately compute size
+    # TODO: estimate compressed size to more accurately compute size 
     cp = subprocess.run("du -kd 0 %s | awk '{ print $1 }'" % target['path'], shell=True, text=True, capture_output=True)
     return int(cp.stdout.replace('\n', ''))
 
@@ -530,7 +697,7 @@ def update_markers(target, pre_marker_timestamp):
     post_marker = marker_path(target, 'post')
     recreate_marker_file(post_marker)
 
-def target_has_new_files(target):
+def target_has_new_files(target, log=True):
 
     pre_marker = marker_path(target, 'pre')
     has_new_files = False 
@@ -544,35 +711,90 @@ def target_has_new_files(target):
             # -- verify an archive actually exists corresponding to this pre-marker file
             marker_archive = get_archive_for_pre_timestamp(target['id'], pre_marker_date)
             if not marker_archive:
-                printorange(f'No archive exists corresponding to the existing pre-marker. This marker is invalid, and all files are considered new.')
+                if log:
+                    printorange(f'No archive exists corresponding to the existing pre-marker. This marker is invalid, and all files are considered new.')
                 has_new_files = True 
             else:
                 
                 cp = subprocess.run(f'find {target["path"]} -newer {pre_marker}'.split(' '), check=True, capture_output=True)
                 new_file_count = len(cp.stdout.splitlines())
                 has_new_files = new_file_count > 0
-                printwhite(f'{new_file_count} new files found since {pre_marker_stamp}')
+                if log:
+                    printwhite(f'{new_file_count} new files found since {pre_marker_stamp}')
         except subprocess.CalledProcessError as cpe:
             printred(cpe.stderr)   
     else:
         has_new_files = True 
-        printwhite(f'No marker file found, all files considered new')
+        if log:
+            printwhite(f'No marker file found, all files considered new')
     
     return has_new_files
 
-def cleanup_local_archives(dry_run=True):
+def cleanup_local_archives(bucket_name, target=None, aggressive=False, dry_run=True):
     '''
-    assertive
-        - if remote and local delete local copy
-        - delete all but latest local copies
-    aggressive
-        no regard for local presence, required remote retrieval popsicle
-        leaves only the latest archive for a target, separately accounting local and remote
+    baseline: keep a minimum number of recent versions, delete anything over and/or older than a margin
+        keep 3 latest
+
+    cleanup:
+        shrink minimum number of recent versions and/or pull up expiration margin 
+        delete anything local that has a copy remote 
     '''
 
-def add_archive(target, results):
+    targets = []
+    if target:
+        targets = [target]
+    else:
+        targets = get_targets()
+    
+    archives = get_archives(with_location=True)
 
-    none_response = (None, None, None, None, )
+    if dry_run and not target:
+        printorange(f'Examining {len(targets)} targets to determine possible space made available by cleanup ({ "not " if not aggressive else "" }aggressive).')
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            
+    cleaned_up_by_target = { t["name"]: 0 for t in targets }
+    for t in targets:        
+
+        target_archives = [ a for a in archives if a['target_id'] == t['id'] ]        
+        
+        archives_newest_first = sorted(target_archives, key=lambda a: a['created_at'])
+        archives_newest_first.reverse()     
+        minimum_to_keep = 1 if aggressive else 3
+        found = 0
+
+        if dry_run and target:
+            printorange(f'Examining {len(archives_newest_first)} ({target["name"]}) files to determine possible space made available by cleanup ({ "not " if not aggressive else "" }aggressive).')
+    
+        for archive in archives_newest_first:
+
+            marked = False 
+
+            if aggressive:
+                if archive['location'] == Location.LOCAL_AND_REMOTE:
+                    cleaned_up_by_target[t['name']] += archive['size_kb']
+                    marked = True 
+                    if not dry_run:
+                        printorange(f'Archive {archive["name"]}/{archive["filename"]} is both remote and local. Deleting local copy.')
+                        os.unlink(archive["filename"])            
+
+            if not marked and os.path.exists(archive['filename']):                
+                if found < minimum_to_keep:
+                    if not dry_run:
+                        printwhite(f'Keeping newer file {archive["filename"]}')
+                    found += 1
+                else:
+                    cleaned_up_by_target[t['name']] += archive['size_kb']
+                    if not dry_run:
+                        printred(f'Deleting file {archive["filename"]}')
+                        os.unlink(archive['filename'])
+    
+    return cleaned_up_by_target[target['name']] if target else cleaned_up_by_target
+
+def add_archive(target, bucket_name, results=None):
+
+    if not results:
+        results = Results()
+
+    none_response = None
 
     if not target_has_new_files(target):
         printorange(f'No new files. Skipping archive creation.')
@@ -583,12 +805,35 @@ def add_archive(target, results):
     free_space = get_working_folder_free_space()
 
     if target_size > free_space:
-
-
-        printred(f'This target may be too big ({target_size} kb) for the available space on the working folder filesystem ({free_space} kb). Please free up {human(target_size - free_space)} and reschedule this target as soon as possible.')
-        results.log('insufficient_space')
-        return none_response
         
+        additional_space_needed = target_size - free_space
+
+        printred(f'This target is {human(additional_space_needed, "kb")} bigger than what is available on the filesystem.')
+
+        space_freed_by_cleanup = cleanup_local_archives(bucket_name, aggressive=False, dry_run=True)
+        space_sum = sum([ space_freed_by_cleanup[t] for t in space_freed_by_cleanup.keys() ])
+
+        if space_sum < additional_space_needed:
+
+            printred(f'Even after cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
+
+            space_freed_by_cleanup = cleanup_local_archives(bucket_name, aggressive=True, dry_run=True)
+            space_sum = sum([ space_freed_by_cleanup[t] for t in space_freed_by_cleanup.keys() ])
+            
+            if space_sum < additional_space_needed:
+                printred(f'Even after aggressively cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
+                results.log('insufficient_space')
+                return none_response
+            else:
+                printorange(f'Cleaning up old local archives aggressively will free {human(space_sum, "kb")}. Proceeding with cleanup.')
+                space_freed_by_cleanup = cleanup_local_archives(bucket_name, aggressive=True, dry_run=False)
+        else:
+
+            printorange(f'Cleaning up old local archives will free {human(space_sum, "kb")}. Proceeding with cleanup.')
+            cleanup_local_archives(bucket_name, aggressive=False, dry_run=False)
+    
+    new_archive_id = None 
+
     try:
 
         target_file = f'{WORKING_FOLDER}/{target["name"]}_{datetime.strftime(datetime.now(), "%Y%m%d_%H%M%S")}.tar.gz'
@@ -597,7 +842,7 @@ def add_archive(target, results):
         if target["excludes"] and len(target["excludes"]) > 0:
             excludes = f'--exclude {" --exclude ".join(target["excludes"].split(":"))}'
 
-        archive_command = f'tar {excludes} -czf {target_file} {target["path"]}'
+        archive_command = f'tar {excludes} --exclude-vcs-ignores -czf {target_file} {target["path"]}'
         printwhite(f'Running archive command: {archive_command}')
 
         # -- strip off microseconds as this is lost when creating the marker file and will prevent the assocation with the archive record
@@ -625,16 +870,41 @@ def add_archive(target, results):
             results.log('insufficient_space')
             raise Exception(report)
         
-        return target_file, returncode, archive_errors, pre_timestamp
+        target_file_stat = shutil.os.stat(target_file)
+        new_archive_id = create_archive(target_id=target['id'], size_kb=target_file_stat.st_size/1024.0, filename=target_file, returncode=returncode, errors=archive_errors, pre_marker_timestamp=pre_timestamp)
+        update_markers(target, pre_timestamp)
+        results.log('archive_created')
+        
+        printgreen(f'Archive record {new_archive_id} created for {target_file}')
+        
+        if target_file:
+            printgreen(f'Created {target["name"]} archive: {target_file}')
+        else:
+            printorange(f'No {target["name"]} archive created')
+            
+        return target_file
 
-    except subprocess.CalledProcessError as cpe:
-        printred(f'Archive process failed')
-        printred(cpe.stderr)
-    
-    except OSError as ose:
+    except:
+        # -- maybe roll back any changes if not past a certain point 
+        # -- group tasks into milestones
+        # -- i.e. milestone 1: create archive, write archive record, move marker files
+        # -- rollback: 
+        # --    if marker file move fails, delete archive record, delete archive file 
+        # --    if archive record fails, delete archive file 
+        # -- milestone 2: push to s3, update archive record
+        #   rollback:
+        #       if archive record fails, don't delete from s3 because the remaining days will only be prorated 
+
         printred(sys.exc_info()[1])
         traceback.print_tb(sys.exc_info()[2])
-    
+
+        if new_archive_id:
+            printred(f'Removing archive record {new_archive_id}')
+            delete_archive(new_archive_id)
+        if os.path.exists(target_file):
+            printred(f'Removing archive file {target_file}')
+            os.unlink(target_file)
+            
     return none_response
 
 
@@ -658,173 +928,164 @@ class Results(object):
     def print(self):
         print(json.dumps(self._results, indent=4))
 
-def run(requested_target=None):
-    '''
-    1. pull all targets
-    2. for each:
-        a. check schedule against last run time and proceed 
-        b. check existence of new files and proceed 
-        c. generate a new archive 
-        d. check status of S3 objects and push latest if not pushed 
-    '''
+class Backup(object):
+    bucket_name = None 
 
-    start = datetime.now()
-
-    printwhite(f'\nBackup run: {datetime.strftime(start, "%c")}')
-
-    targets = []
-
-    if requested_target:
-        target = get_target(name=requested_target)
-        if target:
-            targets.append(target)
-    else:
-        targets = get_targets()
-
-    printwhite(f'{len(targets)} targets identified')
-
-    results = Results()
-
-    for target in targets:
-        archive_file = None 
-        new_archive_id = None 
-        try:
-            printwhite(f'\n*************************************************\n')
-            printwhite(f'Backup target: {target["name"]} ({target["path"]})')
-            if target_is_scheduled(target):
-                printwhite(f'Creating archive for {target["name"]}')
-                (archive_file, returncode, errors, pre_marker_timestamp) = add_archive(target, results)
-                if archive_file:
-                    printgreen(f'Archive created: {archive_file}')
-                    archive_file_stat = shutil.os.stat(archive_file)
-                    new_archive_id = create_archive(target_id=target['id'], size_kb=archive_file_stat.st_size/1024.0, filename=archive_file, returncode=returncode, errors=errors, pre_marker_timestamp=pre_marker_timestamp)
-                    update_markers(target, pre_marker_timestamp)
-                    results.log('archive_created')
-                else:
-                    printorange(f'No archive created')
-                    results.log('other_failure')
-            else:
-                printorange(f'{target["name"]} is not scheduled')
-                results.log('not_scheduled')
-        except:
-            # -- maybe roll back any changes if not past a certain point 
-            # -- group tasks into milestones
-            # -- i.e. milestone 1: create archive, write archive record, move marker files
-            # -- rollback: 
-            # --    if marker file move fails, delete archive record, delete archive file 
-            # --    if archive record fails, delete archive file 
-            # -- milestone 2: push to s3, update archive record
-            #   rollback:
-            #       if archive record fails, don't delete from s3 because the remaining days will only be prorated 
-            if new_archive_id:
-                delete_archive(new_archive_id)
-            if archive_file:
-                os.unlink(archive_file)
-
-        try:
-            '''
-            push frequency is
-                - by the budget (budget priority)
-                    - allow some margin on the budget depending on how soon age-outs will occur
-                - by the calendar (schedule priority)
-                    - may still set a max budget with either a "do not exceed" or "warn if exceeded" flag
-                - by any new content (content priority)
-                    - i.e. any new archive is get pushed 
-                    - allow some threshold required number of new files to consider a new archive for pushing
-            in the case of budget or schedule priority, if no new archive at the time of calculated push time, the next new archive is pushed regardless and the next period is based from there
-            
-            '''
-            last_archive = get_last_archive(target['id'])
-            if last_archive and not last_archive['is_remote']:
-                printorange(f'Last archive is not pushed remotely')
-                if is_push_due(target):
-                    obj = push_archive_to_bucket(last_archive)
-                    if obj:
-                        printgreen(f'Last archive has been pushed remotely')                        
-                        set_archive_remote(last_archive)
-                    else:
-                        printred(f'The last archive failed to push remotely')
-            elif not last_archive:
-                printorange(f'No last archive is available for this target')
-            elif last_archive['is_remote']:
-                printwhite(f'The last archive is already pushed remotely')
-        except:
-            print(sys.exc_info()[1])
-            traceback.print_tb(sys.exc_info()[2])
-        
-        # -- check S3 status (regardless of schedule)
-        # -- check target budget (calculate )
-        # -- clean up S3 / push latest archive if not pushed 
-        # -- update archive push status/time
-        
+    def __init__(self, *args, **kwargs):
+        self.bucket_name = kwargs['bucket_name']
     
-    end = datetime.now()
+    def run(self, requested_target=None):
+        '''
+        1. pull all targets
+        2. for each:
+            a. check schedule against last run time and proceed 
+            b. check existence of new files and proceed 
+            c. generate a new archive 
+            d. check status of S3 objects and push latest if not pushed 
+        '''
 
-    results.print()
+        start = datetime.now()
 
-    printwhite(f'\n\nBackup run completed: {datetime.strftime(end, "%c")}\n')
+        printwhite(f'\nBackup run: {datetime.strftime(start, "%c")}')
+
+        targets = []
+
+        if requested_target:
+            target = get_target(name=requested_target)
+            if target:
+                targets.append(target)
+        else:
+            targets = get_targets()
+        
+        remote_stats = get_remote_stats(targets)
+
+        printwhite(f'{len(targets)} targets identified')
+
+        results = Results()
+
+        for target in targets:
+            try:
+                printwhite(f'\n*************************************************\n')
+                printwhite(f'Backup target: {target["name"]} ({target["path"]})')
+                if target_is_scheduled(target):
+                    printwhite(f'Creating archive for {target["name"]}')
+                    archive_file = add_archive(target, self.bucket_name, results)
+                else:
+                    printorange(f'{target["name"]} is not scheduled')
+                    results.log('not_scheduled')
+            except:
+                printred(sys.exc_info()[1])
+                traceback.print_tb(sys.exc_info()[2])
+
+            try:
+                '''
+                push frequency is
+                    - by the budget (budget priority)
+                        - allow some margin on the budget depending on how soon age-outs will occur
+                    - by the calendar (schedule priority)
+                        - may still set a max budget with either a "do not exceed" or "warn if exceeded" flag
+                    - by any new content (content priority)
+                        - i.e. any new archive is get pushed 
+                        - allow some threshold required number of new files to consider a new archive for pushing
+                in the case of budget or schedule priority, if no new archive at the time of calculated push time, the next new archive is pushed regardless and the next period is based from there
+                
+                '''
+                last_archive = get_last_archive(target['id'])
+                if last_archive and not last_archive['is_remote']:
+                    printorange(f'Last archive is not pushed remotely')
+                    cleanup_remote_archives(bucket_name, remote_stats[target['name']])
+                    if is_push_due(target, remote_stats=remote_stats):
+                        try:
+                            push_archive_to_bucket(last_archive, self.bucket_name)
+                            printgreen(f'Last archive has been pushed remotely')                        
+                            set_archive_remote(last_archive)
+                        except:
+                            printred(f'The last archive failed to push remotely')
+                            printred(sys.exc_info()[1])
+                            traceback.print_tb(sys.exc_info()[2])
+                elif not last_archive:
+                    printorange(f'No last archive is available for this target')
+                elif last_archive['is_remote']:
+                    printwhite(f'The last archive is already pushed remotely')
+            except:
+                printred(sys.exc_info()[1])
+                traceback.print_tb(sys.exc_info()[2])
+            
+            # -- check S3 status (regardless of schedule)
+            # -- check target budget (calculate )
+            # -- clean up S3 / push latest archive if not pushed 
+            # -- update archive push status/time
+            
+        
+        end = datetime.now()
+
+        results.print()
+
+        printwhite(f'\n\nBackup run completed: {datetime.strftime(end, "%c")}\n')
 
 
 
 if __name__ == "__main__":
 
-    if sys.argv[1] == 'db':
-        if sys.argv[2] == 'init':
-            initialize_database()
-        elif sys.argv[2] == 'targets':
-            if sys.argv[3] == 'list':
-                all_targets = get_targets()
-                for target in all_targets:
-                    print(target)
-            elif sys.argv[3] == 'add':
-                print(len(sys.argv))
-                create_target(*sys.argv[4:])
-    elif sys.argv[1] == 's3':
-        if sys.argv[2] == 'archives':
+    bucket_name = os.getenv('S3_BUCKET')
 
-            target_name = sys.argv[4]
+    if not bucket_name:
+        printred('Set S3_BUCKET prior to running this program.')
+        exit(1)
+
+    b = Backup(bucket_name=bucket_name)
+
+    commands = {
+        'db init': initialize_database,
+        'targets list': print_targets,
+        'targets add': create_target,
+        'archives list': print_archives,
+        'archives add': add_archive,
+        'run': b.run        
+    }
+
+    tokens = 1
+
+    while tokens < len(sys.argv) and " ".join(sys.argv[1:tokens+1]) not in commands:
+        tokens += 1
+    
+    command = " ".join(sys.argv[1:tokens+1])
+
+    if command not in commands:
+        printred(f'The command {command} is not supported.')
+        exit(1)
+
+    fn = commands[command]
+    args = []
+    if len(sys.argv) > tokens + 1:
+        args = sys.argv[tokens+1:]
+    print(f'calling {command} {args}')
+    fn(*args) 
+
+    exit(0)
+
+    if sys.argv[1] == 'targets':
+        if sys.argv[2] == 'list':
+
+            all_targets = get_targets()
+            for target in all_targets:
+                printgray(target)
+        elif sys.argv[2] == 'add':
+            create_target(*sys.argv[3:])
+    elif sys.argv[1] == 'archives':
+
+        target_name = None 
+        
+        if len(sys.argv) > 3:
+            target_name = sys.argv[3]
             target = get_target(target_name)
-            
-            if sys.argv[3] == 'list':
-                list_remote_archives(target_name)
-            elif sys.argv[3] == 'add':
-            
-                (target_file, returncode, errors, pre_marker_timestamp) = add_archive(target)
-            
-                if target_file:
-                    print(f'Created {target_name} archive: {target_file}')
-                else:
-                    print(f'No {target_name} archive created')
-    elif sys.argv[1] == 'get':
-        if sys.argv[2] == 'archives':
-            target_name = None 
-            if len(sys.argv) > 3:
-                target_name = sys.argv[3]
-            print_archives(target_name)
-        elif sys.argv[2] == 'targets':
-            print_targets()
-        elif sys.argv[2] == 's3info':
-            target_name = None 
-            if len(sys.argv) > 3:
-                target_name = sys.argv[3]
-                target = get_target(target_name)
-                if not target:
-                    print(f'target {target_name} not found')
-                    exit(1)
-            archives = get_archives(target_name)
-            average_size = 0
-            max_s3_objects = 0
-            if len(archives) > 0:
-                average_size = sum([ a['size_kb'] / (1024.0*1024.0) for a in archives ]) / len(archives)
-            else:
-                average_size = get_target_uncompressed_size_kb(target) / (1024.0*1024.0)
-            lifetime_cost = average_size * REMOTE_STORAGE_COST_GB_PER_MONTH * 6
-            max_s3_objects = math.floor(target['budget_max'] / lifetime_cost)
-            print(f'{target["budget_max"]} will support {max_s3_objects} {average_size} archives over 180 days')
-            s3_objects = get_remote_archives(target_name)
-            print(s3_objects)
+        if sys.argv[2] == 'add':  
+            target_file = add_archive(target, bucket_name)            
+        elif sys.argv[2] == 'get':
+            print_archives(bucket_name, target_name)
+
     elif sys.argv[1] == 'run':
         target = None 
         if len(sys.argv) > 2:
             target = sys.argv[2]
-        run(target)
+        run(bucket_name, target)
