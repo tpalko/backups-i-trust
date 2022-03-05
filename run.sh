@@ -1,14 +1,10 @@
 #!/bin/bash 
 
-if [ -z "${S3_BUCKET}" ]; then 
-  echo "Provide S3_BUCKET"
-  exit 1
-fi 
+LOG_FOLDER=${LOG_FOLDER:=/var/log/frankback}
 
-OUTFILE=backup_$(date +%Y%m%d_%H%M%S).out
-CMD="./backup.py $@"
+[[ ! -d ${LOG_FOLDER} ]] && mkdir -p ${LOG_FOLDER} && echo "Created log folder ${LOG_FOLDER}"
 
-echo ${CMD} > ${OUTFILE}
+DATE=$(date +%Y%m%d_%H%M%S)
+OUTFILE=${LOG_FOLDER}/backup_${DATE}.out
 
-export S3_BUCKET
-${CMD} | tee -a ${OUTFILE} 2>&1
+frankback $@ 2>&1 | tee -a ${OUTFILE}
