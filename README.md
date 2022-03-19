@@ -2,6 +2,20 @@
 
 ## development
 
+3/5/22
+
+needs work for situational awareness 
+- more clear view of what would happen on a run (new files and would push are good, but expensive to calculate and not very visible)
+- missing info on expired remote archives
+- total estimated cost per target 
+- average archive size per target 
+- time since last archive, remote push per target
+
+seeing if new files are present should factor in excludes
+is it possible to use glob to filter out new files found
+also use glob to get a better estimate of archive size 
+maybe.. even use compression history for the target path to estimate actual archive space needs 
+
 12/30/21
 
 targets list -literally anything- will parse to full=True 
@@ -29,9 +43,9 @@ done:
 * main try/except block needs to manage output streams better, only prints traceback to tee -a target 
 * tee -a seems to not flush?
 * fix remote cleanup for sensible defaults (always leave at least one archive per target)
-* fix target listing local/remote counts to show how many local and remote and total
+* what? fix target listing local/remote counts to show how many local and remote and total
 * target listing to show relevant stats about archives, status, cost
 * fix command handling to be more maintainable, documented, standard 
 * what other reports, listings are useful?
-* target enabled flag
-* command-line support for tweaking and editing targets 
+* DONE target enabled flag
+* DONE command-line support for tweaking and editing targets 
