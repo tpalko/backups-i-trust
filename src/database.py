@@ -7,12 +7,12 @@ import subprocess
 
 _TABLES = {
     'archives': '(id integer primary key autoincrement, target_id int, created_at datetime, size_kb int, is_remote bool, remote_push_at datetime, filename char(255), returncode int, errors text, pre_marker_timestamp datetime, md5 char(32))',
-    'targets': '(id integer primary key autoincrement, path text, name char(255), excludes text, budget_max float, schedule char(32), push_strategy char(32), push_period int, is_active bool)',
+    'targets': '(id integer primary key autoincrement, path text, name char(255), excludes text, budget_max float, frequency char(32), push_strategy char(32), push_period int, is_active bool)',
     'runs': '(id integer primary key autoincrement, start_at datetime, end_at datetime, run_stats_json text)'
 }
 ARCHIVE_TARGET_JOIN_SELECT = 'a.id, a.target_id, a.created_at, a.size_kb, a.is_remote, a.remote_push_at, a.filename, a.returncode, a.errors, a.pre_marker_timestamp, a.md5, t.name, t.path, t.is_active'
 ARCHIVE_TARGET_JOIN = 'from archives a inner join targets t on t.id = a.target_id'
-TARGETS_SELECT = 't.id, t.path, t.name, t.excludes, t.budget_max, t.schedule, t.push_strategy, t.push_period, t.is_active'
+TARGETS_SELECT = 't.id, t.path, t.name, t.excludes, t.budget_max, t.frequency, t.push_strategy, t.push_period, t.is_active'
 
 class Database(object):
 
@@ -61,9 +61,12 @@ class Database(object):
             for table in _TABLES:
                 try:
                     c.execute(f'select sql from sqlite_master where name = ?', (table,))
-                    sql = c.fetchone()['sql']
+                    firstrow = c.fetchone()
+                    if not firstrow:
+                        raise sqlite3.OperationalError("fetchone returned nothing")
+                    sql = firstrow['sql']
                     self.logger.success(f'Captured {table} schema')
-                    schema_in_code = f'CREATE TABLE {table} {_TABLES[table]}'
+                    schema_in_code = f'CREATE TABLE "{table}" {_TABLES[table]}'
                     if sql != schema_in_code:
                         self.logger.error(f'WARNING: {table} schema in database does not match schema in code')
                         self.logger.error(f'Database:\t{sql}')
@@ -94,6 +97,13 @@ class Database(object):
             for record in db_records:
                 c.execute(f'update archives set filename = ? where id = ?', (os.path.basename(record['filename']), record['id'], ))
                 self.conn.commit()
+
+    def get_archive(self, archive_id):
+        archive_record = None         
+        with self.cursor() as c:
+            c.execute(f'select {ARCHIVE_TARGET_JOIN_SELECT} {ARCHIVE_TARGET_JOIN} where a.id = ?', (archive_id,))
+            archive_record = c.fetchone()
+        return archive_record
 
     def get_archives(self, target_name=None):
         target = None 
@@ -168,12 +178,12 @@ class Database(object):
             line = c.fetchone()
         return line
 
-    def create_target(self, path, name, schedule, budget, excludes):
+    def create_target(self, path, name, frequency, budget, excludes):
         '''Creates a new target'''
         existing_target = self.get_target(name)
         if not existing_target:
             with self.cursor() as c:        
-                c.execute('insert into targets (path, name, budget, excludes, schedule) values(?, ?, ?, ?, ?)', (path, name, budget, excludes, schedule,))
+                c.execute('insert into targets (path, name, budget, excludes, frequency) values(?, ?, ?, ?, ?)', (path, name, budget, excludes, frequency,))
                 self.conn.commit()
                 self.logger.success(f'Target {name} added')
         else:

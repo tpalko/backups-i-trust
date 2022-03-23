@@ -1,6 +1,113 @@
+import traceback 
+import sys 
 import subprocess 
-from glob import glob 
-from pathlib import Path 
+import math
+from enum import Enum 
+import logging 
+
+FOREGROUND_COLOR_PREFIX = '\033[38;2;'
+FOREGROUND_COLOR_SUFFIX = 'm'
+FOREGROUND_COLOR_RESET = '\033[0m'
+
+class Color(Enum):
+    WHITE = 'white' # '255;255;255'
+    RED = 'red' # '255;0;0'
+    GREEN = 'green' # '0;255;0'
+    ORANGE = 'orange' # '255;165;0'
+    GRAY = 'gray' # '192;192;192'
+    DARKGRAY = 'darkgray' # '128;128;128'
+    YELLOW = 'yellow' # '165:165:0'
+
+COLOR_TABLE = {
+    'white': '255;255;255',
+    'red': '255;0;0',
+    'green': '0;255;0',
+    'orange': '255;165;0',
+    'gray': '192;192;192',
+    'darkgray': '128;128;128',
+    'yellow': '165:165:0'
+}
+
+def colorwrapper(text, color):
+    return f'{FOREGROUND_COLOR_PREFIX}{COLOR_TABLE[color]}{FOREGROUND_COLOR_SUFFIX}{text}{FOREGROUND_COLOR_RESET}'
+
+class FrankLogger(object):
+    
+    logger = None 
+
+    quiet = False 
+    headers = True 
+    log_level = None 
+    
+    def __init__(self, *args, **kwargs):
+        for k in [ p for p in kwargs if p in dir(self) ]:
+            self.__setattr__(k, kwargs[k])
+
+        self.logger = logging.getLogger(__file__)
+        self.logger.setLevel(logging._nameToLevel[self.log_level.upper()])
+        self.logger.addHandler(logging.StreamHandler())        
+   
+    def text(self, message, data=False):
+        if not self.quiet or data:
+            self.logger.warning(message)
+            
+    def debug(self, message, data=False):
+        if not self.quiet or data:
+            self.logger.debug(colorwrapper(message, 'darkgray'))
+    
+    def info(self, message, data=False):
+        if not self.quiet or data:
+            self.logger.info(colorwrapper(message, 'white'))
+    
+    def warning(self, message, data=False):
+        if not self.quiet or data:
+            self.logger.warning(colorwrapper(message, 'orange'))
+
+    def success(self, message, data=False):
+        if not self.quiet or data:
+            self.logger.info(colorwrapper(message, 'green'))
+    
+    def error(self, message, data=False):
+        if not self.quiet or data:
+            self.logger.error(colorwrapper(message, 'red'))
+
+    def exception(self, data=False):
+        stack_summary = traceback.extract_tb(sys.exc_info()[2])
+        self.logger.error(stack_summary)
+        if logging._nameToLevel[self.log_level.upper()] <= logging.ERROR:
+            self.logger.error(sys.exc_info()[0])
+            self.logger.error(sys.exc_info()[1])
+            for line in stack_summary.format():
+                self.logger.error(line)
+
+UNITS = [
+    {
+        'unit': 'day',
+        'duration': 60*24
+    },
+    {
+        'unit': 'hour',
+        'duration': 60
+    },
+    {
+        'unit': 'minute',
+        'duration': 1
+    }  
+]
+
+def time_since(minutes):
+
+    display = []
+
+    for unit in UNITS:
+        if minutes >= unit['duration']:
+            val = math.floor(minutes / unit["duration"])
+            display.append(f'{val} {unit["unit"]}{"s" if val > 1 else ""}')
+            minutes -= val*unit['duration']
+            if len(display) >= 2:
+                break 
+    
+    return " ".join(display)
 
 def stob(val):
     return str(val).lower() in ['1', 'true', 'yes', 'y']
@@ -9,6 +116,24 @@ def get_folder_free_space(folder):
     cp = subprocess.run("df -k %s | grep -v Used | awk '{ print $4 }'" % folder, shell=True, text=True, capture_output=True)
     return int(cp.stdout.replace('\n', ''))
 
+class Frequency(Enum):
+    NEVER = 'never'
+    HOURLY = 'hourly'
+    DAILY = 'daily'
+    WEEKLY = 'weekly'
+    MONTHLY = 'monthly'
+
+FREQUENCY_TO_MINUTES = {
+    Frequency.NEVER.value: 0,
+    Frequency.HOURLY.value: 60,
+    Frequency.DAILY.value: 60*24,
+    Frequency.WEEKLY.value: 60*24*7,
+    Frequency.MONTHLY.value: 60*24*30
+}
+
+def frequency_to_minutes(frequency_value):
+    return FREQUENCY_TO_MINUTES[frequency_value]
+    
 def get_path_uncompressed_size_kb(path, excludes):
 
     # TODO: use target excludes to more accurately compute size

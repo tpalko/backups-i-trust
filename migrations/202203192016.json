@@ -1,0 +1,5 @@
+{
+    "name":"rename targets.schedule -> frequency",
+    "up":"begin transaction; create table targets_temp as select id path, name, excludes, budget_max, schedule as 'frequency', push_strategy, push_period, is_active from targets; drop table targets; alter table targets_temp rename to targets; end transaction;",
+    "down":"begin transaction; create table targets_temp as select id path, name, excludes, budget_max, frequency as 'schedule', push_strategy, push_period, is_active from targets; drop table targets; alter table targets_temp rename to targets; end transaction;"
+}

@@ -3,6 +3,7 @@
 from datetime import datetime
 from enum import Enum 
 import json
+import copy
 import os 
 import shutil
 import sys
@@ -14,9 +15,9 @@ import subprocess
 import inspect 
 import logging
 import time 
-from common import get_folder_free_space, get_path_uncompressed_size_kb, human, stob
+from common import get_folder_free_space, get_path_uncompressed_size_kb, human, stob, time_since, frequency_to_minutes, Frequency, FrankLogger, Color
 from awsclient import AwsClient 
-from columnizer import Columnizer, colorwrapper
+from columnizer import Columnizer
 from database import Database 
 
 MARKER_PLACEHOLDER_TEXT = f'this is a backup timestamp marker. its existence is under the control of {os.path.realpath(__file__)}'
@@ -25,6 +26,7 @@ MARKER_PLACEHOLDER_TEXT = f'this is a backup timestamp marker. its existence is 
 LOGGER_QUIET_DEFAULT = False 
 LOGGER_HEADERS_DEFAULT = True 
 FULL_INFO_DEFAULT = False 
+SORT_DEFAULT = False 
 DRY_RUN_DEFAULT = False
 LOG_LEVEL_DEFAULT = 'info'
 
@@ -61,61 +63,9 @@ class Location(Enum):
     LOCAL_ONLY = 'local_only'
     REMOTE_ONLY = 'remote_only'
     DOES_NOT_EXIST = 'does_not_exist'
+    LOCAL_REMOTE_UNKNOWN = 'local_remote_unknown'
 
-######################
-#
-# display 
-    
-class FrankLogger(object):
-    
-    logger = None 
-
-    quiet = False 
-    headers = True 
-    log_level = None 
-    
-    def __init__(self, *args, **kwargs):
-        for k in [ p for p in kwargs if p in dir(self) ]:
-            self.__setattr__(k, kwargs[k])
-
-        self.logger = logging.getLogger(__file__)
-        self.logger.setLevel(logging._nameToLevel[self.log_level.upper()])
-        self.logger.addHandler(logging.StreamHandler())        
-   
-    def text(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.warning(message)
-            
-    def debug(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.debug(colorwrapper(message, 'darkgray'))
-    
-    def info(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.info(colorwrapper(message, 'white'))
-    
-    def warning(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.warning(colorwrapper(message, 'orange'))
-
-    def success(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.info(colorwrapper(message, 'green'))
-    
-    def error(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.error(colorwrapper(message, 'red'))
-
-    def exception(self, data=False):
-        stack_summary = traceback.extract_tb(sys.exc_info()[2])
-        self.logger.error(stack_summary)
-        if logging._nameToLevel[self.log_level.upper()] <= logging.ERROR:
-            self.logger.error(sys.exc_info()[0])
-            self.logger.error(sys.exc_info()[1])
-            for line in stack_summary.format():
-                self.logger.error(line)
-
-LOG_FILE = '/var/log/frankback/frankback.log'
+# LOG_FILE = '/var/log/frankback/frankback.log'
 
 #######################
 #
@@ -148,8 +98,10 @@ class Backup(object):
     
     db = None 
     awsclient = None 
+
     dry_run = None 
     full_info = False 
+    sort = False 
 
     def __init__(self, *args, **kwargs):
 
@@ -176,6 +128,7 @@ class Backup(object):
         bckt target run <TARGET NAME>
         bckt archive list [TARGET NAME]
         bckt archive prune 
+        bckt archive restore <ID>
         globals:
             set log level:  -l <LOG LEVEL>
             set quiet:      -q
@@ -195,6 +148,7 @@ class Backup(object):
             'archive list': self.print_archives,
             'archive last': self.print_last_archive,
             'archive prune': self.prune_archives,
+            'archive restore': self.restore_archive,
             'fixarchives': self.db.fix_archive_filenames,
             'help': self.print_help
         }
@@ -246,28 +200,35 @@ class Backup(object):
         # -- any arguments left over after matching the command are compiled here 
         args = positional_parameters[tokens:] if len(positional_parameters) > tokens else []
         
-        print_header()
+        self.print_header()
 
         try:
             fn(*args, **named_parameters)
         except:
             logger.error(f'Please refer to help for "{command}"')
             logger.exception()
-
+        
+    def print_header(self):
+        logger.info(f'Date:\t\t{datetime.now()}\nUser:\t\t{os.getenv("USER", "unknown")}\nRC File:\t{RCFILE}\nCommand:\t{" ".join(sys.argv)}\nWorking folder:\t{WORKING_FOLDER}\n\n*********begin output***********\n')
+        
+        if not os.path.isdir(WORKING_FOLDER):
+            os.makedirs(WORKING_FOLDER)
+            logger.success(f'Created working folder: {WORKING_FOLDER}')
+            
     def initialize_database(self):
         '''DOCDEFER:Database.init_db'''
         self.db.init_db()
 
-    def create_target(self, path, name=None, frequency=1440, budget=0.01, excludes=''):
+    def create_target(self, path, name=None, frequency=Frequency.DAILY, budget=0.01, excludes=''):
 
         if not name:
             name = path.replace('/', '-').lstrip('-').rstrip('-')
 
-        self.db.create_target(path, name, schedule=frequency, budget=budget, excludes=excludes)
+        self.db.create_target(path, name, frequency, budget=budget, excludes=excludes)
 
     def edit_target(self, target_name, frequency=None, budget=None, excludes=None):
         '''Sets target parameters'''
-        self.db.update_target(target_name, schedule=frequency, budget_max=budget, excludes=excludes)
+        self.db.update_target(target_name, frequency, budget_max=budget, excludes=excludes)
 
     def pause_target(self, target_name):
         '''Sets target inactive'''
@@ -408,7 +369,7 @@ class Backup(object):
         return cleaned_up_by_target[target['name']] if target else cleaned_up_by_target
 
     def add_archive(self, target_name, results=None):
-        '''Creates a new archive for the provided target name, bypassing the rest of the backup workflow (schedule, active status), however does account for delta-on-disk and honors budget constraints for remote storage'''
+        '''Creates a new archive for the provided target name, bypassing the rest of the backup workflow (frequency, active status), however does account for delta-on-disk and honors budget constraints for remote storage'''
         
         target = self.db.get_target(name=target_name)
         
@@ -527,6 +488,27 @@ class Backup(object):
                 
         return none_response
 
+    def restore_archive(self, archive_id):
+        archive_record = self.db.get_archive(archive_id)
+        if not archive_record:
+            logger.warning(f'Archive {archive_id} was not found')
+            return 
+
+        location = self.get_archive_location(archive_record)
+        if location in [Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY, Location.LOCAL_REMOTE_UNKNOWN]:
+            logger.info(f'Archive {archive_record["filename"]} is local, proceeding to unarchive.')
+            filenamebase = archive_record["filename"].split('.')[0]
+            archive_path = f'{WORKING_FOLDER}/{archive_record["filename"]}'
+            unarchive_folder = f'{WORKING_FOLDER}/restore/{archive_record["name"]}/{filenamebase}'
+            logger.info(f'Unarchiving into {unarchive_folder}')
+            os.makedirs(unarchive_folder)
+            unarchive_command = f'tar -xzf {archive_path} -C {unarchive_folder}'
+            cp = subprocess.run(unarchive_command.split(' '), capture_output=True)
+            logger.warning(cp.args)
+            logger.warning(f'Archive returncode: {cp.returncode}')
+            logger.warning(cp.stdout)
+            logger.error(cp.stderr)
+
     ### other operations 
 
     def get_archives(self, target_name=None):
@@ -538,14 +520,15 @@ class Backup(object):
         return db_records
 
     def target_is_scheduled(self, target):
-        '''Reports true/false based on target.schedule and existence/timestamp of last archive'''
+        '''Reports true/false based on target.frequency and existence/timestamp of last archive'''
 
-        schedule = target['schedule']
+        frequency = target['frequency']
+        frequency_minutes = frequency_to_minutes(frequency)
         last_archive = self.db.get_last_archive(target['id'])
         is_scheduled = False 
         if last_archive:
             since_minutes = (datetime.now() - last_archive['created_at']).total_seconds() / 60
-            is_scheduled = since_minutes >= int(schedule) if schedule.isnumeric() else False 
+            is_scheduled = since_minutes >= frequency_minutes
         else:
             is_scheduled = True 
         return is_scheduled
@@ -567,7 +550,7 @@ class Backup(object):
         else:
             targets = self.db.get_targets()
 
-        # -- target name, path, budget max, schedule, total archive count, % archives remote, last archive date/days, next archive date/days
+        # -- target name, path, budget max, frequency, total archive count, % archives remote, last archive date/days, next archive date/days
         archives = self.get_archives(target_name)
 
         archives_by_target_and_location = { t['id']: {'local': [], 'remote': []} for t in targets }
@@ -581,43 +564,53 @@ class Backup(object):
 
         now = datetime.now()
 
-        for target in targets:
-            logger.debug(f'analyzing {target["name"]}')
+        target_print_items = []
+
+        for target_print_item in targets:
+
+            # target_print_item = copy.copy(target)
+
+            logger.debug(f'analyzing {target_print_item["name"]}')
             
-            target['has_new_files'] = '-'
+            target_print_item['has_new_files'] = '-'
 
-            if self.full_info and target['is_active']:
-                target['has_new_files'] = self.target_has_new_files(target, log=False)
+            if self.full_info and target_print_item['is_active']:
+                target_print_item['has_new_files'] = self.target_has_new_files(target_print_item, log=False)
 
-            target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target['id'] }
+            target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target_print_item['id'] }
             # -- if no archives, we set some defaults and skip the remaining analysis 
             if len(target_archives_by_created_at) == 0:
-                target['last_archive_pushed'] = 'n/a'
-                if self.full_info and target['is_active']:
-                    target['would_push'] = target['has_new_files']
+                target_print_item['last_archive_pushed'] = 'n/a'
+                if self.full_info and target_print_item['is_active']:
+                    target_print_item['would_push'] = target_print_item['has_new_files']
                 continue 
 
             last_archive_created_at = max(target_archives_by_created_at.keys())
             last_archive = target_archives_by_created_at[last_archive_created_at]
             
-            target['cycles_behind'] = 0
-            frequency = int(target['schedule'])
+            target_print_item['cycles_behind'] = 0
+            frequency = target_print_item['frequency']
             minutes_since_last_archive = (now - last_archive['created_at']).total_seconds() / 60.0
-            if frequency != 0:            
-                target['cycles_behind'] = math.floor(minutes_since_last_archive / frequency)
-
-            target['last_archive_pushed'] = last_archive['is_remote']
-            target['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
             
-            target['would_push'] = '-'
-            target['uncompressed_kb'] = '-'
-            if self.full_info and target['is_active']:
-                push_due = self.awsclient.is_push_due(target, remote_stats=remote_stats, print=False)
-                target['would_push'] = push_due and (not target['last_archive_pushed'] or target['has_new_files'])
-                target['uncompressed_kb'] = get_path_uncompressed_size_kb(target['path'], target['excludes'])
+            frequency_minutes = frequency_to_minutes(frequency)
+            if frequency_minutes != 0:            
+                target_print_item['cycles_behind'] = math.floor(minutes_since_last_archive / frequency_minutes)
 
-            target['local_archive_count'] = len(archives_by_target_and_location[target['id']]['local'])
-            target['remote_archive_count'] = len(archives_by_target_and_location[target['id']]['remote'])
+            target_print_item['last_archive_at'] = time_since(minutes_since_last_archive)
+            target_print_item['last_archive_pushed'] = last_archive['is_remote']
+            target_print_item['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
+            
+            target_print_item['would_push'] = '-'
+            target_print_item['uncompressed_kb'] = '-'
+            if self.full_info and target_print_item['is_active']:
+                push_due = self.awsclient.is_push_due(target_print_item, remote_stats=remote_stats, print=False)
+                target_print_item['would_push'] = push_due and (not target_print_item['last_archive_pushed'] or target_print_item['has_new_files'])
+                target_print_item['uncompressed_kb'] = get_path_uncompressed_size_kb(target_print_item['path'], target_print_item['excludes'])
+
+            target_print_item['local_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['local'])
+            target_print_item['remote_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['remote'])
+
+            target_print_items.append(target_print_item)
 
         target_columns = [
             {
@@ -645,26 +638,31 @@ class Backup(object):
                 'header': 'last archive GB'
             },
             {
+                'key': 'frequency'
+            },  
+            {
+                'key': 'cycles_behind'
+            },
+            {
+                'key': 'last_archive_at',
+                'header': 'last archive',
+                'trunc': False
+            },
+            {
                 'key': 'has_new_files',
                 'header': 'new files?',
                 'full': True
             },
             {
-                'key': 'schedule'
-            },
-            {
-                'key': 'cycles_behind'
+                'key': 'would_push',
+                'header': 'would push?',
+                'full': True
             },
             {
                 'key': 'push_strategy'
             },
             {
                 'key': 'budget_max'
-            },
-            {
-                'key': 'would_push',
-                'header': 'would push?',
-                'full': True
             },
             {
                 'key': 'local_archive_count',
@@ -676,27 +674,48 @@ class Backup(object):
             },
         ]
 
+        # -- remove columns based on the full_info flag and whether the column specifies full: True 
         trimmed_target_columns = [ c for c in target_columns if 'full' not in c or (self.full_info and c['full']) ]
 
+        # -- from the trimmed columns, generate the header row
         header = [ c['header'] if 'header' in c else c['key'] for c in trimmed_target_columns ]
-        targets = [ { k: str(v) or '' for k,v in t.items() } for t in targets ]
 
-        table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in targets ]
+        sorted_target_print_items = []
+
+        if self.sort:
+            sorted_target_print_items = []
+            sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == True ])
+            sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == True ])
+            sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == False ])
+        else:
+            sorted_target_print_items = target_print_items
+
+        highlight_template = [ Color.GREEN if t['would_push'] == True else Color.WHITE if t['has_new_files'] == True else None for t in sorted_target_print_items ]
+
+        # -- this appears to blank values in the table data if not str(value)?
+        sorted_target_print_items = [ { k: str(v) or '' for k,v in t.items() } for t in sorted_target_print_items ]
+
+        # -- using the target columns as a guide
+        # -- cycle through the table data and trim values to the length of the header
+        # -- unless the column specifies trunc: False 
+        table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
 
         c = Columnizer(logger=logger, **flag_args)
-        c.print(table, header, data=True)
+        c.print(table, header, highlight_template=highlight_template, data=True)
 
-    def get_archive_location(self, archive, remote_file_map={}):
+    def get_archive_location(self, archive, remote_file_map=None):
         basename = os.path.basename(archive["filename"])
         local_file_exists = os.path.exists(os.path.join(WORKING_FOLDER, archive["filename"]))
-        remote_file_exists = basename in remote_file_map
+        remote_file_exists = remote_file_map and basename in remote_file_map
         
         if local_file_exists and remote_file_exists:
             return Location.LOCAL_AND_REMOTE
-        elif local_file_exists:
+        elif local_file_exists and remote_file_map:
             return Location.LOCAL_ONLY
         elif remote_file_exists:
             return Location.REMOTE_ONLY
+        elif local_file_exists and not remote_file_map:
+            return Location.LOCAL_REMOTE_UNKNOWN
         return Location.DOES_NOT_EXIST
 
     def _get_archives_for_target(self, target_name=None):
@@ -866,7 +885,9 @@ class Backup(object):
                                 logger.warning(f'[ DRY RUN ] Last archive has been pushed remotely')
                             else:
                                 if target['is_active']:
-                                    self.awsclient.push_archive_to_bucket(last_archive, os.path.join(WORKING_FOLDER, last_archive["filename"]))
+                                    archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
+                                    self.logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
+                                    self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
                                     logger.success(f'Last archive has been pushed remotely')                        
                                     self.db.set_archive_remote(last_archive)
                                 else:
@@ -903,6 +924,7 @@ def parse_flags():
         'quiet': LOGGER_QUIET_DEFAULT,
         'headers': LOGGER_HEADERS_DEFAULT,
         'full_info': FULL_INFO_DEFAULT,
+        'sort': SORT_DEFAULT,
         'dry_run': DRY_RUN_DEFAULT,
         'log_level': LOG_LEVEL_DEFAULT
     }
@@ -912,6 +934,7 @@ def parse_flags():
         '-q': {'quiet': True},
         '--no-headers': {'headers': False},
         '-f': {'full_info': True},
+        '-s': {'sort': True},
         '-d': {'dry_run': True}
     }
 
@@ -971,13 +994,7 @@ def solicit():
         logger.warning('(You can turn this off')
         logger.warning('by adding no_solicit = true in your FRANKBACK_RC_FILE')
         logger.warning('or by setting env FRANKBACK_NO_SOLICIT=1)')
-    
-def print_header():
-    logger.info(f'Date:\t\t{datetime.now()}\nUser:\t\t{os.getenv("USER", "unknown")}\nRC File:\t{RCFILE}\nCommand:\t{" ".join(sys.argv)}\nWorking folder:\t{WORKING_FOLDER}\n\n*********begin output***********\n')
-    
-    if not os.path.isdir(WORKING_FOLDER):
-        os.makedirs(WORKING_FOLDER)
-        logger.success(f'Created working folder: {WORKING_FOLDER}')
+
 
 if __name__ == "__main__":
     

@@ -7,7 +7,7 @@ import base64
 from contextlib import contextmanager
 from datetime import datetime 
 from pytz import timezone 
-from common import get_path_uncompressed_size_kb, human
+from common import get_path_uncompressed_size_kb, human, frequency_to_minutes, time_since
 
 UTC = timezone('UTC')
 
@@ -84,16 +84,18 @@ class AwsClient:
                 lifetime_cost = average_size * REMOTE_STORAGE_COST_GB_PER_MONTH * 6
                 max_s3_objects = math.floor(target['budget_max'] / lifetime_cost)
                 if max_s3_objects == 0:
+                    push_due = False 
                     message = f'One archive has a lifetime cost of {lifetime_cost}. At a max budget of {target["budget_max"]}, no archives can be stored in S3'
                 else:
                     minutes_per_push = (180.0*24*60) / max_s3_objects
                     push_due = current_s3_objects < max_s3_objects and minutes_since_last_object > minutes_per_push
-                    message = f'Given a calculated size of {average_size} GB and a budget of ${target["budget_max"]}, a push can be accepted every {minutes_per_push} minutes for max {max_s3_objects} objects. It has been {minutes_since_last_object} minutes and there are {current_s3_objects} objects.'
+                    message = f'Given a calculated size of {average_size} GB and a budget of ${target["budget_max"]}, a push can be accepted every {time_since(minutes_per_push)} for max {max_s3_objects} objects. It has been {time_since(minutes_since_last_object)} and there are {current_s3_objects} objects.'
             
             elif target['push_strategy'] == PushStrategy.SCHEDULE_PRIORITY.value:
                 
-                push_due = minutes_since_last_object > target['push_period']
-                message = f'The push period is {target["push_period"]} minutes and it has been {minutes_since_last_object} minutes'
+                frequency_minutes = frequency_to_minutes(target['frequency'])
+                push_due = minutes_since_last_object >= frequency_minutes
+                message = f'The push period is {target["frequency"]} ({frequency_minutes} minutes) and it has been {time_since(minutes_since_last_object)}'
             
             elif target['push_strategy'] == PushStrategy.CONTENT_PRIORITY.value:
                 
@@ -130,37 +132,38 @@ class AwsClient:
         #   wait_until_exists
         #   wait_until_not_exists'
 
-    def get_archive_bytes(self, filename):
+    def _get_archive_bytes(self, filename):
         b = None 
         with open(filename, 'rb') as f:
             b = f.read()
         return b
 
-    def push_archive_to_bucket(self, archive, archive_path):
-        self.logger.success(f'Pushing {archive_path} ({human(archive["size_kb"], "kb")})')
+    def push_archive(self, target_name, archive_filename, archive_path):
+
         object = None 
+
         with self.archivebucket(self.bucket_name) as bucket:
-            b64_md5 = base64.b64encode(bytes(archive['md5'], 'utf-8')).decode()
-            self.logger.info(f'{b64_md5}')
             
             method = 'upload_file'
-            #method = 'put_object'
 
-            key = f'{archive["name"]}/{os.path.basename(archive["filename"])}'
+            key = f'{target_name}/{os.path.basename(archive_filename)}'
+
             if method == 'upload_file':
                 from boto3.s3.transfer import TransferConfig
                 uploadconfig = TransferConfig(multipart_threshold=4*1024*1024*1024)
                 object = bucket.upload_file(archive_path, key, Config=uploadconfig)
             elif method == 'put_object':
+                # b64_md5 = base64.b64encode(bytes(archive['md5'], 'utf-8')).decode()
+                # self.logger.info(f'{b64_md5}')
                 object = bucket.put_object(
-                    Body=self.get_archive_bytes(archive_path),
+                    Body=self._get_archive_bytes(archive_path),
                     #ContentLength=int(archive['size_kb']*1024),
                     #ContentMD5=b64_md5,
                     Key=key
                 )
         return object
 
-    def delete_objects(self, objs):
+    def _delete_objects(self, objs):
         if len(objs) > 0:
             with self.archivebucket(self.bucket_name) as bucket:
                 delete_resp = bucket.delete_objects(
@@ -174,29 +177,28 @@ class AwsClient:
                 if 'Deleted' in delete_resp and len(delete_resp['Deleted']) > 0:
                     self.logger.success(f'Delete confirmed: {",".join([ o["Key"] for o in delete_resp["Deleted"] ])}')
 
-    def object_is_target(self, obj, target_name):
+    def _object_is_target(self, obj, target_name):
         return (obj.key.find(f'{target_name}/{target_name}_') == 0 or obj.key.find(f'{target_name}_') == 0)
+
+    def _get_remote_stats_for_target(self, target, s3_objects):
+        archives_by_last_modified = { obj.last_modified: obj for obj in s3_objects if self._object_is_target(obj, target['name']) }
+            
+        now = UTC.localize(datetime.utcnow())
+        aged = [ archives_by_last_modified[last_modified] for last_modified in archives_by_last_modified if (now - last_modified).total_seconds() / (60*60*24) >= 180 ]
+        current_count = len([ last_modified for last_modified in archives_by_last_modified if (now - last_modified).total_seconds() / (60*60*24) < 180 ])
+
+        return { 
+            'max_last_modified': max(archives_by_last_modified.keys()) if len(archives_by_last_modified.keys()) > 0 else None, 
+            'count': len(archives_by_last_modified),
+            'aged': aged,
+            'current_count': current_count
+        }
 
     def get_remote_stats(self, targets):
         
         s3_objects = self.get_remote_archives()
-        remote_stats = {}
+        remote_stats = { target['name']: self._get_remote_stats_for_target(target, s3_objects) for target in targets }
         
-        for target in targets:        
-            
-            archives_by_last_modified = { obj.last_modified: obj for obj in s3_objects if self.object_is_target(obj, target['name']) }
-            
-            now = UTC.localize(datetime.utcnow())
-            aged = [ archives_by_last_modified[last_modified] for last_modified in archives_by_last_modified if (now - last_modified).total_seconds() / (60*60*24) >= 180 ]
-            current_count = len([ last_modified for last_modified in archives_by_last_modified if (now - last_modified).total_seconds() / (60*60*24) < 180 ])
-
-            remote_stats[target['name']] = { 
-                'max_last_modified': max(archives_by_last_modified.keys()) if len(archives_by_last_modified.keys()) > 0 else None, 
-                'count': len(archives_by_last_modified),
-                'aged': aged,
-                'current_count': current_count
-            }
-
         return remote_stats 
 
     def get_remote_archives(self, target_name=None):
@@ -222,7 +224,7 @@ class AwsClient:
         # TODO: improve the matching here 
         with self.archivebucket(self.bucket_name) as bucket:
             all_objects = bucket.objects.all()
-            objects = [ obj for obj in all_objects if (target_name and self.object_is_target(obj, target_name)) or not target_name ]
+            objects = [ obj for obj in all_objects if (target_name and self._object_is_target(obj, target_name)) or not target_name ]
         return objects 
 
     def cleanup_remote_archives(self, remote_stats, dry_run=True):
@@ -231,4 +233,4 @@ class AwsClient:
             if dry_run:
                 self.logger.error(f'DRY RUN -- skipping remote deletion')
             else:
-                self.delete_objects(remote_stats["aged"])
+                self._delete_objects(remote_stats["aged"])

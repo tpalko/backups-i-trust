@@ -1,22 +1,6 @@
 import logging 
 import subprocess
-
-FOREGROUND_COLOR_PREFIX = '\033[38;2;'
-FOREGROUND_COLOR_SUFFIX = 'm'
-FOREGROUND_COLOR_RESET = '\033[0m'
-
-COLOR_TABLE = {
-    'white': '255;255;255',
-    'red': '255;0;0',
-    'green': '0;255;0',
-    'orange': '255;165;0',
-    'gray': '192;192;192',
-    'darkgray': '128;128;128',
-    'yellow': '165:165:0'
-}
-
-def colorwrapper(text, color):
-    return f'{FOREGROUND_COLOR_PREFIX}{COLOR_TABLE[color]}{FOREGROUND_COLOR_SUFFIX}{text}{FOREGROUND_COLOR_RESET}'
+from common import colorwrapper
 
 class Columnizer(object):
 
@@ -28,7 +12,7 @@ class Columnizer(object):
     alignment = None 
     header_color = None 
     row_color = None 
-    cell_padding_default = 5
+    cell_padding_default = 3
     header_color_default = 'white'
     row_color_default = 'orange'
     quiet = False 
@@ -95,12 +79,12 @@ class Columnizer(object):
     # def _table_data(self, table):
     #     return "\n".join([ "\t".join([ str(v) for v in v in row ]) for row in table ])
 
-    def _printf_command(self, table, color):
+    def _printf_command(self, data, color, highlight_template=None):
         tabs_cmd = f'tabs {",".join([ str(c) for c in self.tabs ])}'
-        print_data = "\n\"; printf \"".join([ colorwrapper("\t".join([ str(v) for v in row ]), color) for row in table ])
+        print_data = "\n\"; printf \"".join([ colorwrapper("\t".join([ str(v) for v in row ]), color if not (highlight_template and highlight_template[i]) else highlight_template[i].value) for i, row in enumerate(data) ])
         return "%s; printf \"%s\n\"; %s;" % (tabs_cmd, print_data, self.TAB_STD_INTERVAL)
         
-    def print(self, table, header, data=False):
+    def print(self, table, header, highlight_template=None, data=False):
 
         if not data and self.quiet:
             return 
@@ -120,6 +104,6 @@ class Columnizer(object):
             printout += self._printf_command(header, self.header_color)
         
         table = self._align_table(table)
-        printout += self._printf_command(table, self.row_color)
+        printout += self._printf_command(table, self.row_color, highlight_template=highlight_template)
 
         subprocess.run(printout, shell=True)

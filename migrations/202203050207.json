@@ -1,0 +1,6 @@
+{
+    "name": "add column is_active to targets",
+    "up": "alter table targets add column is_active bool not null default true",
+    "down": "BEGIN; CREATE TABLE targets_temp as select id, path, name, excludes, budget_max, schedule, push_strategy, push_period from targets; DROP TABLE targets; ALTER TABLE targets_temp RENAME TO targets; END TRANSACTION;"
+  }
+  
