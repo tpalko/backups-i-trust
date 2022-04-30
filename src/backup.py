@@ -206,6 +206,8 @@ class Backup(object):
             fn(*args, **named_parameters)
         except:
             logger.error(f'Please refer to help for "{command}"')
+            logger.error('Some common errors:')
+            logger.error('- unquoted strings with spaces')
             logger.exception()
         
     def print_header(self):
@@ -219,7 +221,7 @@ class Backup(object):
         '''DOCDEFER:Database.init_db'''
         self.db.init_db()
 
-    def create_target(self, path, name=None, frequency=Frequency.DAILY, budget=0.01, excludes=''):
+    def create_target(self, path, name=None, frequency=Frequency.DAILY.value, budget=0.01, excludes=''):
 
         if not name:
             name = path.replace('/', '-').lstrip('-').rstrip('-')
@@ -228,7 +230,11 @@ class Backup(object):
 
     def edit_target(self, target_name, frequency=None, budget=None, excludes=None):
         '''Sets target parameters'''
-        self.db.update_target(target_name, frequency, budget_max=budget, excludes=excludes)
+        frequency_choices = [ m.lower() for m in Frequency.__members__ ]
+        if frequency not in frequency_choices:
+            raise Exception(f'{frequency} is not a valid frequency (choose: {",".join(frequency_choices)})')
+
+        self.db.update_target(target_name, frequency=frequency, budget_max=budget, excludes=excludes)
 
     def pause_target(self, target_name):
         '''Sets target inactive'''
@@ -552,7 +558,7 @@ class Backup(object):
 
         # -- target name, path, budget max, frequency, total archive count, % archives remote, last archive date/days, next archive date/days
         archives = self.get_archives(target_name)
-
+        
         archives_by_target_and_location = { t['id']: {'local': [], 'remote': []} for t in targets }
         for archive in archives:
             if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
@@ -578,30 +584,36 @@ class Backup(object):
                 target_print_item['has_new_files'] = self.target_has_new_files(target_print_item, log=False)
 
             target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target_print_item['id'] }
+            
+            target_print_item['last_archive_at'] = '-'
+            target_print_item['last_archive_pushed'] = '-'
+            target_print_item['last_archive_size'] = '-'
+            target_print_item['cycles_behind'] = '-'
+            target_print_item['would_push'] = '-'
+            target_print_item['uncompressed_kb'] = '-'
+            
             # -- if no archives, we set some defaults and skip the remaining analysis 
             if len(target_archives_by_created_at) == 0:
                 target_print_item['last_archive_pushed'] = 'n/a'
                 if self.full_info and target_print_item['is_active']:
                     target_print_item['would_push'] = target_print_item['has_new_files']
-                continue 
+            else:
+                last_archive_created_at = max(target_archives_by_created_at.keys())
+                last_archive = target_archives_by_created_at[last_archive_created_at]
+                
+                target_print_item['cycles_behind'] = 0
+                frequency = target_print_item['frequency']
+                minutes_since_last_archive = (now - last_archive['created_at']).total_seconds() / 60.0
+                
+                frequency_minutes = frequency_to_minutes(frequency)
+                if frequency_minutes != 0:            
+                    target_print_item['cycles_behind'] = math.floor(minutes_since_last_archive / frequency_minutes)
 
-            last_archive_created_at = max(target_archives_by_created_at.keys())
-            last_archive = target_archives_by_created_at[last_archive_created_at]
+                target_print_item['last_archive_at'] = time_since(minutes_since_last_archive)
+                target_print_item['last_archive_pushed'] = last_archive['is_remote']
+                target_print_item['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
             
-            target_print_item['cycles_behind'] = 0
-            frequency = target_print_item['frequency']
-            minutes_since_last_archive = (now - last_archive['created_at']).total_seconds() / 60.0
             
-            frequency_minutes = frequency_to_minutes(frequency)
-            if frequency_minutes != 0:            
-                target_print_item['cycles_behind'] = math.floor(minutes_since_last_archive / frequency_minutes)
-
-            target_print_item['last_archive_at'] = time_since(minutes_since_last_archive)
-            target_print_item['last_archive_pushed'] = last_archive['is_remote']
-            target_print_item['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
-            
-            target_print_item['would_push'] = '-'
-            target_print_item['uncompressed_kb'] = '-'
             if self.full_info and target_print_item['is_active']:
                 push_due = self.awsclient.is_push_due(target_print_item, remote_stats=remote_stats, print=False)
                 target_print_item['would_push'] = push_due and (not target_print_item['last_archive_pushed'] or target_print_item['has_new_files'])
@@ -609,6 +621,8 @@ class Backup(object):
 
             target_print_item['local_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['local'])
             target_print_item['remote_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['remote'])
+            
+            target_print_item['monthly_cost'] = "%.3f" % sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ])
 
             target_print_items.append(target_print_item)
 
@@ -662,6 +676,9 @@ class Backup(object):
                 'key': 'push_strategy'
             },
             {
+                'key': 'monthly_cost'
+            },
+            {
                 'key': 'budget_max'
             },
             {
@@ -682,13 +699,12 @@ class Backup(object):
 
         sorted_target_print_items = []
 
-        if self.sort:
-            sorted_target_print_items = []
+        if self.sort and self.full_info:
             sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == True ])
             sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == True ])
             sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == False ])
         else:
-            sorted_target_print_items = target_print_items
+            sorted_target_print_items = sorted(target_print_items, key=lambda t: t['path'])
 
         highlight_template = [ Color.GREEN if t['would_push'] == True else Color.WHITE if t['has_new_files'] == True else None for t in sorted_target_print_items ]
 
@@ -698,7 +714,7 @@ class Backup(object):
         # -- using the target columns as a guide
         # -- cycle through the table data and trim values to the length of the header
         # -- unless the column specifies trunc: False 
-        table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
+        table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and not self.full_info and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
 
         c = Columnizer(logger=logger, **flag_args)
         c.print(table, header, highlight_template=highlight_template, data=True)
@@ -739,7 +755,7 @@ class Backup(object):
 
             db_record['s3_cost_per_month'] = "%.4f" % 0.00
             if basename in s3_objects_by_filename:
-                db_record['s3_cost_per_month'] = "%.4f" % self.awsclient.get_object_storage_cost_per_month(s3_objects_by_filename[basename])
+                db_record['s3_cost_per_month'] = "%.4f" % self.awsclient.get_object_storage_cost_per_month(s3_objects_by_filename[basename].size)
             
             archive_display.append(db_record)
 
@@ -755,13 +771,15 @@ class Backup(object):
                 'created_at': obj.last_modified, 
                 'size_mb': "%.1f" % (obj.size/(1024.0*1024.0)), 
                 'location': Location.REMOTE_ONLY, 
-                's3_cost_per_month': "%.4f" % self.awsclient.get_object_storage_cost_per_month(obj) 
+                's3_cost_per_month': "%.4f" % self.awsclient.get_object_storage_cost_per_month(obj.size) 
             })
 
             if not target_name:
                 archive_display[-1]['target_name'] = '-'
         
         #total_cost = sum([ float(a['s3_cost_per_month'])  for a in archive_display ])
+        
+        archive_display = [ a for a in archive_display if a['location'] != Location.DOES_NOT_EXIST ]
         
         table = []
         header = []
@@ -886,7 +904,7 @@ class Backup(object):
                             else:
                                 if target['is_active']:
                                     archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
-                                    self.logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
+                                    logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
                                     self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
                                     logger.success(f'Last archive has been pushed remotely')                        
                                     self.db.set_archive_remote(last_archive)

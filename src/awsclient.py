@@ -46,8 +46,8 @@ class AwsClient:
         self.logger.debug(f'S3 bucket yield in')
         self.logger.debug(f'S3 bucket calculation time: {"%.1f" % (time_in - time_out).total_seconds()} seconds')
 
-    def get_object_storage_cost_per_month(self, obj):
-        return REMOTE_STORAGE_COST_GB_PER_MONTH*(obj.size / (1024 ** 3))
+    def get_object_storage_cost_per_month(self, size_bytes):
+        return REMOTE_STORAGE_COST_GB_PER_MONTH*(size_bytes / (1024 ** 3))
 
     def is_push_due(self, target, remote_stats=None, print=True):
         

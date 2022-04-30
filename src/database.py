@@ -3,7 +3,9 @@ from datetime import datetime
 import sqlite3 
 import logging 
 from contextlib import contextmanager
-import subprocess 
+import subprocess
+
+from awsclient import PushStrategy 
 
 _TABLES = {
     'archives': '(id integer primary key autoincrement, target_id int, created_at datetime, size_kb int, is_remote bool, remote_push_at datetime, filename char(255), returncode int, errors text, pre_marker_timestamp datetime, md5 char(32))',
@@ -178,12 +180,15 @@ class Database(object):
             line = c.fetchone()
         return line
 
-    def create_target(self, path, name, frequency, budget, excludes):
+    def create_target(self, path, name, frequency, budget, excludes, is_active=True, push_strategy=PushStrategy.BUDGET_PRIORITY):
         '''Creates a new target'''
         existing_target = self.get_target(name)
         if not existing_target:
+            # -- if enum, use value 
+            if type(push_strategy).__name__ == 'PushStrategy':
+                push_strategy = push_strategy.value 
             with self.cursor() as c:        
-                c.execute('insert into targets (path, name, budget, excludes, frequency) values(?, ?, ?, ?, ?)', (path, name, budget, excludes, frequency,))
+                c.execute('insert into targets (path, name, budget_max, excludes, frequency, is_active, push_strategy) values(?, ?, ?, ?, ?, ?, ?)', (path, name, budget, excludes, frequency, is_active, push_strategy,))
                 self.conn.commit()
                 self.logger.success(f'Target {name} added')
         else:
