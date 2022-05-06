@@ -214,7 +214,7 @@ class Backup(object):
             logger.exception()
         
     def print_header(self):
-        logger.info(f'Date:\t\t{datetime.now()}\nUser:\t\t{os.getenv("USER", "unknown")}\nRC File:\t{RCFILE}\nCommand:\t{" ".join(sys.argv)}\nWorking folder:\t{WORKING_FOLDER}\n\n*********begin output***********\n')
+        logger.info(f'Date:\t\t{datetime.now()}\nUser:\t\t{os.getenv("USER", "unknown")}\nDatabase file:\t{DATABASE_FILE}\nRC File:\t{RCFILE}\nCommand:\t{" ".join(sys.argv)}\nWorking folder:\t{WORKING_FOLDER}\n\n*********begin output***********\n')
         
         if not os.path.isdir(WORKING_FOLDER):
             os.makedirs(WORKING_FOLDER)
