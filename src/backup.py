@@ -29,6 +29,7 @@ VERBOSE_DEFAULT = False
 SORT_DEFAULT = False 
 DRY_RUN_DEFAULT = False
 LOG_LEVEL_DEFAULT = 'info'
+FORCE_PUSH_LATEST_DEFAULT = False 
 
 S3_BUCKET = None 
 BACKUP_HOME = f'{os.path.dirname(os.path.realpath(__file__))}'
@@ -528,7 +529,7 @@ class Backup(object):
                 else:
                     logger.warning(f'Not cleaning remote archives (is_active={target["is_active"]})')
 
-                if self.awsclient.is_push_due(target, remote_stats=remote_stats):
+                if self.force_push_latest or self.awsclient.is_push_due(target, remote_stats=remote_stats):
                     try:
                         if self.dry_run:
                             logger.warning(f'[ DRY RUN ] Last archive has been pushed remotely')
@@ -964,7 +965,8 @@ def parse_flags():
         'verbose': VERBOSE_DEFAULT,
         'sort': SORT_DEFAULT,
         'dry_run': DRY_RUN_DEFAULT,
-        'log_level': LOG_LEVEL_DEFAULT
+        'log_level': LOG_LEVEL_DEFAULT,
+        'force_push_latest': FORCE_PUSH_LATEST_DEFAULT
     }
     
     # -- input matching these will update flags with the corresponding dict
@@ -973,7 +975,8 @@ def parse_flags():
         '--no-headers': {'headers': False},
         '-v': {'verbose': True},
         '-s': {'sort': True},
-        '-d': {'dry_run': True}
+        '-d': {'dry_run': True},
+        '-p': {'force_push_latest': True}
     }
 
     # -- input matching these will become keyword args passed to the command

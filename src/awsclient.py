@@ -50,6 +50,7 @@ class AwsClient:
         return REMOTE_STORAGE_COST_GB_PER_MONTH*(size_bytes / (1024 ** 3))
 
     def is_push_due(self, target, remote_stats=None, print=True):
+        '''According to the target push strategy, budget, and the objects already remotely stored, could an(y) archive be pushed?'''
         
         archives = self.db.get_archives(target['name'])
 
