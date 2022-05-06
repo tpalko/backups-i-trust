@@ -25,7 +25,7 @@ MARKER_PLACEHOLDER_TEXT = f'this is a backup timestamp marker. its existence is 
 # -- defaults 
 LOGGER_QUIET_DEFAULT = False 
 LOGGER_HEADERS_DEFAULT = True 
-FULL_INFO_DEFAULT = False 
+VERBOSE_DEFAULT = False 
 SORT_DEFAULT = False 
 DRY_RUN_DEFAULT = False
 LOG_LEVEL_DEFAULT = 'info'
@@ -100,7 +100,7 @@ class Backup(object):
     awsclient = None 
 
     dry_run = None 
-    full_info = False 
+    verbose = False 
     sort = False 
 
     def __init__(self, *args, **kwargs):
@@ -126,13 +126,14 @@ class Backup(object):
         bckt target list [TARGET NAME]
         bckt run [TARGET NAME]
         bckt target run <TARGET NAME>
+        bckt target push <TARGET NAME>
         bckt archive list [TARGET NAME]
         bckt archive prune 
         bckt archive restore <ID>
         globals:
             set log level:  -l <LOG LEVEL>
             set quiet:      -q
-            set full info:  -f
+            set verbose:    -v
             set dry run:    -d
             set no headers: --no-headers
         '''
@@ -145,6 +146,7 @@ class Backup(object):
             'target list': self.print_targets,
             'run': self.run,
             'target run': self.add_archive,
+            'target push': self.push_target_latest,
             'archive list': self.print_archives,
             'archive last': self.print_last_archive,
             'archive prune': self.prune_archives,
@@ -216,6 +218,24 @@ class Backup(object):
         if not os.path.isdir(WORKING_FOLDER):
             os.makedirs(WORKING_FOLDER)
             logger.success(f'Created working folder: {WORKING_FOLDER}')
+    
+    def targets(self, target_name=None, quiet=True):
+         targets = []
+
+         if target_name:
+             target = self.db.get_target(name=target_name)
+             if target:
+                 targets.append(target)
+         else:
+             targets = self.db.get_targets()
+         
+         remote_stats = self.awsclient.get_remote_stats(targets)
+         
+         for target in targets:
+             if not quiet:
+                 logger.info(f'\n*************************************************\n')
+                 logger.info(f'Backup target: {target["name"]} ({target["path"]})')
+             yield target, remote_stats[target['name']]
             
     def initialize_database(self):
         '''DOCDEFER:Database.init_db'''
@@ -230,9 +250,10 @@ class Backup(object):
 
     def edit_target(self, target_name, frequency=None, budget=None, excludes=None):
         '''Sets target parameters'''
-        frequency_choices = [ m.lower() for m in Frequency.__members__ ]
-        if frequency not in frequency_choices:
-            raise Exception(f'{frequency} is not a valid frequency (choose: {",".join(frequency_choices)})')
+        if frequency is not None:
+            frequency_choices = [ m.lower() for m in Frequency.__members__ ]
+            if frequency not in frequency_choices:
+                raise Exception(f'"{frequency}" is not a valid frequency (choose: {",".join(frequency_choices)})')
 
         self.db.update_target(target_name, frequency=frequency, budget_max=budget, excludes=excludes)
 
@@ -493,7 +514,42 @@ class Backup(object):
                 os.unlink(target_file)
                 
         return none_response
+    
+    def push_target_latest(self, target_name=None):
+        
+        for target, remote_stats in self.targets(target_name, quiet=False):
+            
+            last_archive = self.db.get_last_archive(target['id'])
+            if last_archive and not last_archive['is_remote']:
+                logger.warning(f'Last archive is not pushed remotely')
 
+                if target['is_active']:
+                    self.awsclient.cleanup_remote_archives(remote_stats, dry_run=self.dry_run)
+                else:
+                    logger.warning(f'Not cleaning remote archives (is_active={target["is_active"]})')
+
+                if self.awsclient.is_push_due(target, remote_stats=remote_stats):
+                    try:
+                        if self.dry_run:
+                            logger.warning(f'[ DRY RUN ] Last archive has been pushed remotely')
+                        else:
+                            if target['is_active']:
+                                archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
+                                logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
+                                self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
+                                logger.success(f'Last archive has been pushed remotely')                        
+                                self.db.set_archive_remote(last_archive)
+                            else:
+                                logger.warning(f'Not pushing remote (is_active={target["is_active"]})')
+                    except:
+                        logger.error(f'The last archive failed to push remotely')
+                        logger.error(sys.exc_info()[1])
+                        traceback.print_tb(sys.exc_info()[2])
+            elif not last_archive:
+                logger.warning(f'No last archive is available for this target')
+            elif last_archive['is_remote']:
+                logger.info(f'The last archive is already pushed remotely')
+    
     def restore_archive(self, archive_id):
         archive_record = self.db.get_archive(archive_id)
         if not archive_record:
@@ -547,40 +603,34 @@ class Backup(object):
                 are there archives not pushed? (implies there are files not pushed)
                 monthly cost in s3?'''
 
-        targets = []
-
-        if target_name:
-            target = self.db.get_target(name=target_name)
-            if target:
-                targets.append(target)
-        else:
-            targets = self.db.get_targets()
-
-        # -- target name, path, budget max, frequency, total archive count, % archives remote, last archive date/days, next archive date/days
-        archives = self.get_archives(target_name)
-        
-        archives_by_target_and_location = { t['id']: {'local': [], 'remote': []} for t in targets }
-        for archive in archives:
-            if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
-                archives_by_target_and_location[archive['target_id']]['local'].append(archive)
-            if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.REMOTE_ONLY ]:
-                archives_by_target_and_location[archive['target_id']]['remote'].append(archive)
-
-        remote_stats = self.awsclient.get_remote_stats(targets)
-
         now = datetime.now()
 
         target_print_items = []
-
-        for target_print_item in targets:
-
+        archives_by_target_and_location = {}
+        
+        for target_print_item, remote_stats in self.targets(target_name):
+            
+            # -- target name, path, budget max, frequency, total archive count, % archives remote, last archive date/days, next archive date/days
+            archives = self.get_archives(target_print_item['name'])
+            
+            logger.debug(f'have {len(archives)} archives for {target_print_item["name"]}')
+            
+            if target_print_item['id'] not in archives_by_target_and_location:
+                archives_by_target_and_location[target_print_item['id']] = {'local': [], 'remote': [] }
+                
+            for archive in archives:
+                if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
+                    archives_by_target_and_location[archive['target_id']]['local'].append(archive)
+                if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.REMOTE_ONLY ]:
+                    archives_by_target_and_location[archive['target_id']]['remote'].append(archive)
+                    
             # target_print_item = copy.copy(target)
 
             logger.debug(f'analyzing {target_print_item["name"]}')
             
             target_print_item['has_new_files'] = '-'
 
-            if self.full_info and target_print_item['is_active']:
+            if self.verbose and target_print_item['is_active']:
                 target_print_item['has_new_files'] = self.target_has_new_files(target_print_item, log=False)
 
             target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target_print_item['id'] }
@@ -595,7 +645,7 @@ class Backup(object):
             # -- if no archives, we set some defaults and skip the remaining analysis 
             if len(target_archives_by_created_at) == 0:
                 target_print_item['last_archive_pushed'] = 'n/a'
-                if self.full_info and target_print_item['is_active']:
+                if self.verbose and target_print_item['is_active']:
                     target_print_item['would_push'] = target_print_item['has_new_files']
             else:
                 last_archive_created_at = max(target_archives_by_created_at.keys())
@@ -614,7 +664,7 @@ class Backup(object):
                 target_print_item['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
             
             
-            if self.full_info and target_print_item['is_active']:
+            if self.verbose and target_print_item['is_active']:
                 push_due = self.awsclient.is_push_due(target_print_item, remote_stats=remote_stats, print=False)
                 target_print_item['would_push'] = push_due and (not target_print_item['last_archive_pushed'] or target_print_item['has_new_files'])
                 target_print_item['uncompressed_kb'] = get_path_uncompressed_size_kb(target_print_item['path'], target_print_item['excludes'])
@@ -622,10 +672,19 @@ class Backup(object):
             target_print_item['local_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['local'])
             target_print_item['remote_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['remote'])
             
-            target_print_item['monthly_cost'] = "%.3f" % sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ])
+            target_print_item['monthly_cost'] = sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ])
+            cost_string = str(target_print_item['monthly_cost'])
+            if cost_string.find('-') >= 0:
+                places = cost_string.split('-')[1]
+            else:
+                places = 3
+            
+            target_print_item['monthly_cost'] = f'%.{places}f' % target_print_item['monthly_cost']
 
             target_print_items.append(target_print_item)
-
+        
+        logger.debug(json.dumps(target_print_items, indent=4))
+        
         target_columns = [
             {
                 'key': 'name',
@@ -691,30 +750,35 @@ class Backup(object):
             },
         ]
 
-        # -- remove columns based on the full_info flag and whether the column specifies full: True 
-        trimmed_target_columns = [ c for c in target_columns if 'full' not in c or (self.full_info and c['full']) ]
+        # -- remove columns based on the verbose flag and whether the column specifies full: True 
+        trimmed_target_columns = [ c for c in target_columns if 'full' not in c or (self.verbose and c['full']) ]
+        
+        sorted_target_print_items = sorted(target_print_items, key=lambda t: t['path'])
 
+        if self.sort:
+            if self.verbose:
+                sorted_target_print_items = sorted(target_print_items, key=lambda t: not stob(t['would_push']))
+                sorted_target_print_items = sorted(sorted_target_print_items, key=lambda t: not stob(t['has_new_files']))
+            sorted_target_print_items = sorted(sorted_target_print_items, key=lambda t: not stob(t['is_active']))
+            # sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == True ])
+            # sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == True ])
+            # sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == False ])
+
+        highlight_template = [ Color.DARKGRAY if not t['is_active'] else Color.GREEN if t['would_push'] == True else Color.WHITE if t['has_new_files'] == True else None for t in sorted_target_print_items ]
+        
+        sorted_target_print_items = [ { k: t[k] for k in t.keys() if k not in ['is_active'] } for t in sorted_target_print_items ]
+        trimmed_target_columns = [ c for c in trimmed_target_columns if c['key'] not in ['is_active'] ]
+        
         # -- from the trimmed columns, generate the header row
         header = [ c['header'] if 'header' in c else c['key'] for c in trimmed_target_columns ]
-
-        sorted_target_print_items = []
-
-        if self.sort and self.full_info:
-            sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == True ])
-            sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == True ])
-            sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == False and t['has_new_files'] == False ])
-        else:
-            sorted_target_print_items = sorted(target_print_items, key=lambda t: t['path'])
-
-        highlight_template = [ Color.GREEN if t['would_push'] == True else Color.WHITE if t['has_new_files'] == True else None for t in sorted_target_print_items ]
-
+        
         # -- this appears to blank values in the table data if not str(value)?
         sorted_target_print_items = [ { k: str(v) or '' for k,v in t.items() } for t in sorted_target_print_items ]
 
         # -- using the target columns as a guide
         # -- cycle through the table data and trim values to the length of the header
         # -- unless the column specifies trunc: False 
-        table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and not self.full_info and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
+        table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and not self.verbose and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
 
         c = Columnizer(logger=logger, **flag_args)
         c.print(table, header, highlight_template=highlight_template, data=True)
@@ -838,27 +902,12 @@ class Backup(object):
 
         logger.info(f'\nBackup run: {datetime.strftime(start, "%c")}')
 
-        targets = []
-
-        if target_name:
-            target = self.db.get_target(name=target_name)
-            if target:
-                targets.append(target)
-        else:
-            targets = self.db.get_targets()
-        
-        remote_stats = self.awsclient.get_remote_stats(targets)
-
-        logger.info(f'{len(targets)} targets identified')
-
         results = Results()
 
-        for target in targets:
+        for target, remote_stats in self.targets(target_name, quiet=False):
 
             try:
-                logger.info(f'\n*************************************************\n')
-                logger.info(f'Backup target: {target["name"]} ({target["path"]})')
-
+                
                 is_scheduled = self.target_is_scheduled(target)
                 if target['is_active'] and is_scheduled:
                     if self.dry_run:
@@ -888,36 +937,7 @@ class Backup(object):
                 in the case of budget or schedule priority, if no new archive at the time of calculated push time, the next new archive is pushed regardless and the next period is based from there
                 
                 '''
-                last_archive = self.db.get_last_archive(target['id'])
-                if last_archive and not last_archive['is_remote']:
-                    logger.warning(f'Last archive is not pushed remotely')
-
-                    if target['is_active']:
-                        self.awsclient.cleanup_remote_archives(remote_stats[target['name']], dry_run=self.dry_run)
-                    else:
-                        logger.warning(f'Not cleaning remote archives (is_active={target["is_active"]})')
-
-                    if self.awsclient.is_push_due(target, remote_stats=remote_stats):
-                        try:
-                            if self.dry_run:
-                                logger.warning(f'[ DRY RUN ] Last archive has been pushed remotely')
-                            else:
-                                if target['is_active']:
-                                    archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
-                                    logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
-                                    self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
-                                    logger.success(f'Last archive has been pushed remotely')                        
-                                    self.db.set_archive_remote(last_archive)
-                                else:
-                                    logger.warning(f'Not pushing remote (is_active={target["is_active"]})')
-                        except:
-                            logger.error(f'The last archive failed to push remotely')
-                            logger.error(sys.exc_info()[1])
-                            traceback.print_tb(sys.exc_info()[2])
-                elif not last_archive:
-                    logger.warning(f'No last archive is available for this target')
-                elif last_archive['is_remote']:
-                    logger.info(f'The last archive is already pushed remotely')
+                self.push_target_latest(target['name'])
             except:
                 logger.exception()
             
@@ -941,7 +961,7 @@ def parse_flags():
     flags = {
         'quiet': LOGGER_QUIET_DEFAULT,
         'headers': LOGGER_HEADERS_DEFAULT,
-        'full_info': FULL_INFO_DEFAULT,
+        'verbose': VERBOSE_DEFAULT,
         'sort': SORT_DEFAULT,
         'dry_run': DRY_RUN_DEFAULT,
         'log_level': LOG_LEVEL_DEFAULT
@@ -951,7 +971,7 @@ def parse_flags():
     flags_options = {
         '-q': {'quiet': True},
         '--no-headers': {'headers': False},
-        '-f': {'full_info': True},
+        '-v': {'verbose': True},
         '-s': {'sort': True},
         '-d': {'dry_run': True}
     }

@@ -59,9 +59,10 @@ class AwsClient:
 
         if not remote_stats:
             remote_stats = self.get_remote_stats([target])
-
-        last_modified = remote_stats[target['name']]['max_last_modified']
-        current_s3_objects = remote_stats[target['name']]['count']
+            remote_stats = remote_stats[target['name']]
+            
+        last_modified = remote_stats['max_last_modified']
+        current_s3_objects = remote_stats['count']
 
         if last_modified:
             now = UTC.localize(datetime.utcnow())
