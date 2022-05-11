@@ -103,6 +103,8 @@ class Backup(object):
     dry_run = None 
     verbose = False 
     sort = False 
+    
+    current_target = None 
 
     def __init__(self, *args, **kwargs):
 
@@ -220,7 +222,7 @@ class Backup(object):
             os.makedirs(WORKING_FOLDER)
             logger.success(f'Created working folder: {WORKING_FOLDER}')
     
-    def targets(self, target_name=None, quiet=True):
+    def targets(self, target_name=None):
          targets = []
 
          if target_name:
@@ -233,10 +235,9 @@ class Backup(object):
          remote_stats = self.awsclient.get_remote_stats(targets)
          
          for target in targets:
-             if not quiet:
-                 logger.info(f'\n*************************************************\n')
-                 logger.info(f'Backup target: {target["name"]} ({target["path"]})')
+             logger.set_context(target['name'])
              yield target, remote_stats[target['name']]
+             logger.clear_context()
             
     def initialize_database(self):
         '''DOCDEFER:Database.init_db'''
@@ -409,9 +410,16 @@ class Backup(object):
         if not self.target_has_new_files(target):
             logger.warning(f'No new files. Skipping archive creation.')
             results.log('no_new_files')
-            return none_response
-
-        target_size = get_path_uncompressed_size_kb(target['path'], target['excludes'])
+            return
+            
+        target_size = get_path_uncompressed_size_kb(target['path'], target['excludes'])        
+        last_archive = self.db.get_last_archive(target['id'])
+        
+        increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
+        if increase > 0:
+            logger.warning(f'This target increased in size by {increase}% since the last archive')
+            # -- TODO: can put a limiter in here 
+            
         free_space = get_folder_free_space(WORKING_FOLDER)
 
         if target_size > free_space:
@@ -433,7 +441,7 @@ class Backup(object):
                 if space_sum < additional_space_needed:
                     logger.error(f'Even after aggressively cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
                     results.log('insufficient_space')
-                    return none_response
+                    return 
                 else:
                     logger.warning(f'Cleaning up old local archives aggressively will free {human(space_sum, "kb")}. Proceeding with cleanup.')
                     space_freed_by_cleanup = self.cleanup_local_archives(aggressive=True, dry_run=self.dry_run)
@@ -445,8 +453,9 @@ class Backup(object):
         new_archive_id = None 
 
         try:
-
+                
             target_file = f'{WORKING_FOLDER}/{target["name"]}_{datetime.strftime(datetime.now(), "%Y%m%d_%H%M%S")}.tar.gz'
+            logger.info(f'Creating archive for {target["name"]}: {target_file}')
 
             excludes = ""
             if target["excludes"] and len(target["excludes"]) > 0:
@@ -459,29 +468,28 @@ class Backup(object):
             pre_timestamp = datetime.strptime(datetime.strftime(datetime.now(), "%Y-%m-%d %H:%M:%S"), "%Y-%m-%d %H:%M:%S")
 
             cp = subprocess.run(archive_command.split(' '), capture_output=True)
-            logger.warning(cp.args)
-            returncode = cp.returncode
+            logger.warning(cp.args)            
             logger.warning(f'Archive returncode: {cp.returncode}')
-            logger.warning(cp.stdout)
-            logger.error(cp.stderr)
+            if cp.stdout:
+                logger.warning(cp.stdout)
+            if cp.stderr:
+                logger.error(cp.stderr)
             archive_errors = str(cp.stderr)
 
             cp = subprocess.run(f'tar --test-label -f {target_file}'.split(' '), capture_output=True)
             logger.warning(cp.args)
             logger.warning(f'Archive test returncode: {cp.returncode}')
-            logger.error(cp.stderr)
+            if cp.stderr:
+                logger.error(cp.stderr)
             
             cp.check_returncode()
 
             if archive_errors.find("No space left on device") >= 0:
-                report = "Insufficient space while archiving. Archive target file (assumed partial) will be deleted. Please clean up the disk and reschedule this target as soon as possible."
-                if os.path.exists(target_file):
-                    os.unlink(target_file)
                 results.log('insufficient_space')
-                raise Exception(report)
+                raise Exception("Insufficient space while archiving. Archive target file (assumed partial) will be deleted. Please clean up the disk and reschedule this target as soon as possible.")
             
             target_file_stat = shutil.os.stat(target_file)
-            new_archive_id = self.db.create_archive(target_id=target['id'], size_kb=target_file_stat.st_size/1024.0, filename=target_file, returncode=returncode, errors=archive_errors, pre_marker_timestamp=pre_timestamp)
+            new_archive_id = self.db.create_archive(target_id=target['id'], size_kb=target_file_stat.st_size/1024.0, filename=target_file, returncode=cp.returncode, errors=archive_errors, pre_marker_timestamp=pre_timestamp)
             self.update_markers(target, pre_timestamp)
             results.log('archive_created')
             
@@ -491,8 +499,6 @@ class Backup(object):
                 logger.success(f'Created {target["name"]} archive: {target_file}')
             else:
                 logger.warning(f'No {target["name"]} archive created')
-                
-            return target_file
 
         except:
             # -- maybe roll back any changes if not past a certain point 
@@ -513,12 +519,10 @@ class Backup(object):
             if os.path.exists(target_file):
                 logger.error(f'Removing archive file {target_file}')
                 os.unlink(target_file)
-                
-        return none_response
     
     def push_target_latest(self, target_name=None):
         
-        for target, remote_stats in self.targets(target_name, quiet=False):
+        for target, remote_stats in self.targets(target_name):
             
             last_archive = self.db.get_last_archive(target['id'])
             if last_archive and not last_archive['is_remote']:
@@ -531,17 +535,16 @@ class Backup(object):
 
                 if self.force_push_latest or self.awsclient.is_push_due(target, remote_stats=remote_stats):
                     try:
-                        if self.dry_run:
-                            logger.warning(f'[ DRY RUN ] Last archive has been pushed remotely')
-                        else:
-                            if target['is_active']:
-                                archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
-                                logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
+                        if target['is_active']:
+                            archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
+                            logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
+                            if not self.dry_run:
                                 self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
-                                logger.success(f'Last archive has been pushed remotely')                        
+                            logger.success(f'Last archive has been pushed remotely')                        
+                            if not self.dry_run:
                                 self.db.set_archive_remote(last_archive)
-                            else:
-                                logger.warning(f'Not pushing remote (is_active={target["is_active"]})')
+                        else:
+                            logger.warning(f'Not pushing remote (is_active={target["is_active"]})')
                     except:
                         logger.error(f'The last archive failed to push remotely')
                         logger.error(sys.exc_info()[1])
@@ -905,17 +908,13 @@ class Backup(object):
 
         results = Results()
 
-        for target, remote_stats in self.targets(target_name, quiet=False):
-
+        for target, remote_stats in self.targets(target_name):
+            
             try:
                 
                 is_scheduled = self.target_is_scheduled(target)
-                if target['is_active'] and is_scheduled:
-                    if self.dry_run:
-                        logger.warning(f'[ DRY RUN ] Creating archive for {target["name"]}')
-                    else:
-                        logger.info(f'Creating archive for {target["name"]}')
-                        archive_file = self.add_archive(target["name"], results)
+                if target['is_active'] and is_scheduled:                    
+                    self.add_archive(target["name"], results)
                 else:
                     logger.warning(f'Not running {target["name"]} (scheduled={is_scheduled}, active={target["is_active"]})')
                     if not target["is_active"]:

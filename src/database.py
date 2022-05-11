@@ -160,7 +160,6 @@ class Database(object):
             c.execute('insert into archives (target_id, created_at, size_kb, is_remote, remote_push_at, filename, returncode, errors, pre_marker_timestamp, md5) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', params)
             self.conn.commit()
             new_archive_id = c.lastrowid
-            self.logger.success(f'Archive {new_archive_id} added')
         
         return new_archive_id
 
@@ -221,6 +220,3 @@ class Database(object):
             c.execute('update archives set is_remote = 1, remote_push_at = ? where id = ?', (datetime.now(), archive['id'],))
             self.conn.commit()
             self.logger.success(f'Archive {archive["id"]} set as remote')
-
-
-

@@ -38,6 +38,8 @@ class FrankLogger(object):
     quiet = False 
     headers = True 
     log_level = None 
+    context = None 
+    dry_run = False 
     
     def __init__(self, *args, **kwargs):
         for k in [ p for p in kwargs if p in dir(self) ]:
@@ -47,29 +49,45 @@ class FrankLogger(object):
         self.logger.setLevel(logging._nameToLevel[self.log_level.upper()])
         self.logger.addHandler(logging.StreamHandler())        
    
-    def text(self, message, data=False):
-        if not self.quiet or data:
+    def clear_context(self):
+        self.context = None 
+        
+    def set_context(self, context):
+        self.context = context 
+    
+    def wrap_context(self, message):
+        if self.dry_run:
+            message = f'[ DRY RUN ] {message}'
+        if self.context:
+            message = f'[ {self.context} ] {message}'
+        return message 
+    
+    def _wrap(self, call, message, color=None):
+        if not self.quiet:
+            message = self.wrap_context(message)
+            if color:
+                call(colorwrapper(message, color))
+            else:
+                call(message)
+    
+    def text(self, message):
+        if not self.quiet:
             self.logger.warning(message)
             
-    def debug(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.debug(colorwrapper(message, 'darkgray'))
+    def debug(self, message):
+        self._wrap(self.logger.debug, message, 'darkgray')
     
-    def info(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.info(colorwrapper(message, 'white'))
+    def info(self, message):
+        self._wrap(self.logger.info, message, 'white')
     
-    def warning(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.warning(colorwrapper(message, 'orange'))
+    def warning(self, message):
+        self._wrap(self.logger.warning, message, 'orange')
 
-    def success(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.info(colorwrapper(message, 'green'))
+    def success(self, message):
+        self._wrap(self.logger.info, message, 'green')
     
-    def error(self, message, data=False):
-        if not self.quiet or data:
-            self.logger.error(colorwrapper(message, 'red'))
+    def error(self, message):
+        self._wrap(self.logger.error, message, 'red')
 
     def exception(self, data=False):
         stack_summary = traceback.extract_tb(sys.exc_info()[2])
@@ -104,7 +122,7 @@ def time_since(minutes):
             val = math.floor(minutes / unit["duration"])
             display.append(f'{val} {unit["unit"]}{"s" if val > 1 else ""}')
             minutes -= val*unit['duration']
-            if len(display) >= 2:
+            if len(display) >= 1:
                 break 
     
     return " ".join(display)
@@ -140,8 +158,8 @@ def get_path_uncompressed_size_kb(path, excludes):
     # TODO: estimate compressed size to more accurately compute size 
     cp = subprocess.run("du -kd 0 %s | awk '{ print $1 }'" % path, shell=True, text=True, capture_output=True)
     path_size = int(cp.stdout.replace('\n', ''))
-
-    # excludes = excludes.split(':')
+    
+    #excludes = excludes.split(':')
 
     # build:aws_backup/working:thirdparty:*.box:rpi/images:node_modules:clients/riproad:*.log:boxes:minecraft/worlds:minecraft/server/world
     # for path in Path(path).rglob('*'):
