@@ -113,6 +113,17 @@ UNITS = [
     }  
 ]
 
+def smart_precision(float_value):
+    
+    float_value_string = str(float_value)
+    # -- a hyphen will indicate the negative exponent of a python-formatted exponentially small number 2e-3 = 0.002 
+    if float_value_string.find('-') >= 0:
+        places = float_value_string.split('-')[1]
+    else:
+        places = 3
+        
+    return f'{float_value}:.{places}f'
+
 def time_since(minutes):
 
     display = []

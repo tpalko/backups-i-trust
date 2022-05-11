@@ -15,7 +15,7 @@ import subprocess
 import inspect 
 import logging
 import time 
-from common import get_folder_free_space, get_path_uncompressed_size_kb, human, stob, time_since, frequency_to_minutes, Frequency, FrankLogger, Color
+from common import smart_precision, get_folder_free_space, get_path_uncompressed_size_kb, human, stob, time_since, frequency_to_minutes, Frequency, FrankLogger, Color
 from awsclient import AwsClient 
 from columnizer import Columnizer
 from database import Database 
@@ -30,11 +30,13 @@ SORT_DEFAULT = False
 DRY_RUN_DEFAULT = False
 LOG_LEVEL_DEFAULT = 'info'
 FORCE_PUSH_LATEST_DEFAULT = False 
+EXCLUDE_VCS_IGNORES_DEFAULT = False  
 
 S3_BUCKET = None 
 BACKUP_HOME = f'{os.path.dirname(os.path.realpath(__file__))}'
 DATABASE_FILE = os.path.join(BACKUP_HOME, 'backups.db')
 WORKING_FOLDER = os.path.join(BACKUP_HOME, 'working')
+EXCLUDE_VCS_IGNORES = EXCLUDE_VCS_IGNORES_DEFAULT
 NO_SOLICIT = False 
 
 # -- config from file overwrites defaults 
@@ -49,6 +51,7 @@ if RCFILE and os.path.exists(RCFILE) and os.path.isfile(RCFILE):
         DATABASE_FILE = p['default']['database_file'] if 'database_file' in p['default'] else DATABASE_FILE
         WORKING_FOLDER = p['default']['working_folder'] if 'working_folder' in p['default'] else WORKING_FOLDER
         NO_SOLICIT = stob(p['default']['no_solicit']) if 'no_solicit' in p['default'] else NO_SOLICIT
+        EXCLUDE_VCS_IGNORES = stob(p['default']['exclude_vcs_ignores']) if 'exclude_vcs_ignoers' in p['default'] else EXCLUDE_VCS_IGNORES_DEFAULT
 else:
     RCFILE = None 
 
@@ -57,6 +60,7 @@ S3_BUCKET = os.getenv('S3_BUCKET', S3_BUCKET)
 DATABASE_FILE = os.getenv('DATABASE_FILE', DATABASE_FILE)
 WORKING_FOLDER = os.getenv('WORKING_FOLDER', WORKING_FOLDER)
 NO_SOLICIT = stob(os.getenv('FRANKBACK_NO_SOLICIT', NO_SOLICIT))
+EXCLUDE_VCS_IGNORES = stob(os.getenv('EXCLUDE_VCS_IGNORES', EXCLUDE_VCS_IGNORES))
 DRY_RUN = stob(os.getenv('DRY_RUN', False))
 
 class Location(Enum):
@@ -123,6 +127,7 @@ class Backup(object):
     def init_commands(self):
         '''
         bckt db init
+        bckt info 
         bckt target add <path> [-n NAME] [-f FREQUENCY] [-b BUDGET] [-e EXCLUDES]
         bckt target edit <TARGET NAME> [-f FREQUENCY] [-b BUDGET] [-e EXCLUDES]
         bckt target pause|unpause <TARGET NAME>
@@ -142,6 +147,7 @@ class Backup(object):
         '''
         return {
             'db init': self.initialize_database,
+            'info': self.print_header,
             'target add': self.create_target,
             'target edit': self.edit_target,
             'target pause': self.pause_target,
@@ -217,10 +223,6 @@ class Backup(object):
         
     def print_header(self):
         logger.info(f'Date:\t\t{datetime.now()}\nUser:\t\t{os.getenv("USER", "unknown")}\nDatabase file:\t{DATABASE_FILE}\nRC File:\t{RCFILE}\nCommand:\t{" ".join(sys.argv)}\nWorking folder:\t{WORKING_FOLDER}\n\n*********begin output***********\n')
-        
-        if not os.path.isdir(WORKING_FOLDER):
-            os.makedirs(WORKING_FOLDER)
-            logger.success(f'Created working folder: {WORKING_FOLDER}')
     
     def targets(self, target_name=None):
          targets = []
@@ -396,7 +398,12 @@ class Backup(object):
                             os.unlink(os.path.join(WORKING_FOLDER, archive["filename"]))
         
         return cleaned_up_by_target[target['name']] if target else cleaned_up_by_target
-
+    
+    def _create_working_folder(self):
+        if not os.path.isdir(WORKING_FOLDER):
+            os.makedirs(WORKING_FOLDER)
+            logger.success(f'Created working folder: {WORKING_FOLDER}')
+            
     def add_archive(self, target_name, results=None):
         '''Creates a new archive for the provided target name, bypassing the rest of the backup workflow (frequency, active status), however does account for delta-on-disk and honors budget constraints for remote storage'''
         
@@ -417,9 +424,11 @@ class Backup(object):
         
         increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
         if increase > 0:
-            logger.warning(f'This target increased in size by {increase}% since the last archive')
+            logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
             # -- TODO: can put a limiter in here 
-            
+        
+        self._create_working_folder()
+        
         free_space = get_folder_free_space(WORKING_FOLDER)
 
         if target_size > free_space:
@@ -460,8 +469,12 @@ class Backup(object):
             excludes = ""
             if target["excludes"] and len(target["excludes"]) > 0:
                 excludes = f'--exclude {" --exclude ".join(target["excludes"].split(":"))}'
+            
+            archive_command = f'tar {excludes} -czf {target_file} {target["path"]}'
 
-            archive_command = f'tar {excludes} --exclude-vcs-ignores -czf {target_file} {target["path"]}'
+            if self.exclude_vcs_ignores:
+                archive_command = f'tar {excludes} --exclude-vcs-ignores -czf {target_file} {target["path"]}'
+                
             logger.info(f'Running archive command: {archive_command}')
 
             # -- strip off microseconds as this is lost when creating the marker file and will prevent the assocation with the archive record
@@ -521,6 +534,7 @@ class Backup(object):
                 os.unlink(target_file)
     
     def push_target_latest(self, target_name=None):
+        '''Pushes latest target archive remotely, if not already remote. Honors budget/time constraints by default, so usually used with -p (force push latest). If target name not provided, acts on all targets.'''
         
         for target, remote_stats in self.targets(target_name):
             
@@ -555,6 +569,8 @@ class Backup(object):
                 logger.info(f'The last archive is already pushed remotely')
     
     def restore_archive(self, archive_id):
+        '''Unpacks the archive identified by the ID provided into WORKING_FOLDER/restore/<target name>/<archive filename base>'''
+        
         archive_record = self.db.get_archive(archive_id)
         if not archive_record:
             logger.warning(f'Archive {archive_id} was not found')
@@ -675,15 +691,7 @@ class Backup(object):
 
             target_print_item['local_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['local'])
             target_print_item['remote_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['remote'])
-            
-            target_print_item['monthly_cost'] = sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ])
-            cost_string = str(target_print_item['monthly_cost'])
-            if cost_string.find('-') >= 0:
-                places = cost_string.split('-')[1]
-            else:
-                places = 3
-            
-            target_print_item['monthly_cost'] = f'%.{places}f' % target_print_item['monthly_cost']
+            target_print_item['monthly_cost'] = smart_precision(sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ]))
 
             target_print_items.append(target_print_item)
         
@@ -965,7 +973,8 @@ def parse_flags():
         'sort': SORT_DEFAULT,
         'dry_run': DRY_RUN_DEFAULT,
         'log_level': LOG_LEVEL_DEFAULT,
-        'force_push_latest': FORCE_PUSH_LATEST_DEFAULT
+        'force_push_latest': FORCE_PUSH_LATEST_DEFAULT,
+        'exclude_vcs_ignores': EXCLUDE_VCS_IGNORES
     }
     
     # -- input matching these will update flags with the corresponding dict

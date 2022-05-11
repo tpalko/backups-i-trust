@@ -91,7 +91,7 @@ class AwsClient:
                 else:
                     minutes_per_push = (180.0*24*60) / max_s3_objects
                     push_due = current_s3_objects < max_s3_objects and minutes_since_last_object > minutes_per_push
-                    message = f'Given a calculated size of {average_size} GB and a budget of ${target["budget_max"]}, a push can be accepted every {time_since(minutes_per_push)} for max {max_s3_objects} objects. It has been {time_since(minutes_since_last_object)} and there are {current_s3_objects} objects.'
+                    message = f'Given a calculated size of {average_size:.1f} GB and a budget of ${target["budget_max"]:.2f}, a push can be accepted every {time_since(minutes_per_push)} for max {max_s3_objects} objects. It has been {time_since(minutes_since_last_object)} and there are {current_s3_objects} objects.'
             
             elif target['push_strategy'] == PushStrategy.SCHEDULE_PRIORITY.value:
                 
