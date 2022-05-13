@@ -149,6 +149,7 @@ class Database(object):
         new_archive_id = None 
 
         cp = subprocess.run("md5sum %s | awk '{ print $1 }'" % filename, text=True, shell=True, capture_output=True)
+        self.logger.debug(f'md5sum output: {cp.stdout}')
         digest = str([ line for line in cp.stdout.splitlines() if line ][0])
 
         # with open(filename, 'rb') as f:

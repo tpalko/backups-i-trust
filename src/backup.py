@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.9
 
 from datetime import datetime
 from enum import Enum 
@@ -75,6 +75,10 @@ class Location(Enum):
 #######################
 #
 # operation
+
+class QuitException(Exception):
+    pass 
+
 
 class Results(object):
     
@@ -317,6 +321,8 @@ class Backup(object):
                     if log:                        
                         logger.info(f'{new_file_count} new files found since {pre_marker_stamp}')
                         logger.debug(new_file_output)
+            except KeyboardInterrupt as ki:
+                raise QuitException("Interrupt signal received")
             except subprocess.CalledProcessError as cpe:
                 logger.error(cpe.stderr)   
                 traceback.print_tb(sys.exc_info()[2])
@@ -421,11 +427,12 @@ class Backup(object):
             
         target_size = get_path_uncompressed_size_kb(target['path'], target['excludes'])        
         last_archive = self.db.get_last_archive(target['id'])
-        
-        increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
-        if increase > 0:
-            logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
-            # -- TODO: can put a limiter in here 
+       
+        if last_archive: 
+            increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
+            if increase > 0:
+                logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
+                # -- TODO: can put a limiter in here 
         
         self._create_working_folder()
         
@@ -915,9 +922,12 @@ class Backup(object):
         logger.info(f'\nBackup run: {datetime.strftime(start, "%c")}')
 
         results = Results()
+        quit = False 
 
         for target, remote_stats in self.targets(target_name):
-            
+            if quit:
+                break 
+
             try:
                 
                 is_scheduled = self.target_is_scheduled(target)
@@ -929,9 +939,14 @@ class Backup(object):
                         results.log('not_active')
                     if not is_scheduled:
                         results.log('not_scheduled')
+            except QuitException as qe:
+                quit = True 
             except:
                 logger.exception()
-
+           
+            if quit:
+                break 
+ 
             try:
                 '''
                 push frequency is
