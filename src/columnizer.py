@@ -56,7 +56,7 @@ class Columnizer(object):
 
                 self.tabs = [ m + extra if (i >= cix+1 and extra > 0) else m for i,m in enumerate(self.tabs) ]
 
-                self.logger.debug(f'{cell_value} (p {self.cell_padding}) -> {",".join([ str(t) for t in self.tabs ])}')
+                # self.logger.debug(f'{cell_value} (p {self.cell_padding}) -> {",".join([ str(t) for t in self.tabs ])}')
                 # self.logger.debug(f'curr_tab: {curr_tab}, cell_value: {cell_value}, cell_width: {cell_width}, extra: {extra}, cix_tabs: {self.tabs[cix]}')
 
     def _align_spaces(self, value, cell_width, alignment):

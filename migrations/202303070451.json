@@ -1,0 +1,5 @@
+{
+    "name":"add marker columns",
+    "up":"alter table targets add column pre_marker_at datetime null; alter table targets add column post_marker_at datetime null",
+    "down":"BEGIN; CREATE TABLE targets_temp as select id, path, name, excludes, budget_max, frequency, push_strategy, push_period, is_active from targets; DROP TABLE targets; ALTER TABLE targets_temp RENAME TO targets; END TRANSACTION;"
+}

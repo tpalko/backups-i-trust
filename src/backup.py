@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import cowpy 
 from datetime import datetime
 from enum import Enum 
 import json
@@ -22,22 +23,51 @@ from database import Database
 
 MARKER_PLACEHOLDER_TEXT = f'this is a backup timestamp marker. its existence is under the control of {os.path.realpath(__file__)}'
 
-# -- defaults 
-LOGGER_QUIET_DEFAULT = False 
-LOGGER_HEADERS_DEFAULT = True 
-VERBOSE_DEFAULT = False 
-SORT_DEFAULT = False 
-DRY_RUN_DEFAULT = False
-LOG_LEVEL_DEFAULT = 'info'
-FORCE_PUSH_LATEST_DEFAULT = False 
-EXCLUDE_VCS_IGNORES_DEFAULT = False  
+EXCLUDE_VCS_IGNORES_DEFAULT = False 
+ORDER_BY_DEFAULT = 'name'
+
+# -- this is the default template to be updated by matching input below 
+# -- it will be passed as keyword args to logging and the main backup class 
+FLAGS = {
+    'quiet': False,
+    'headers': True,
+    'verbose': False,
+    'sort_targets': False,
+    'order_by': ORDER_BY_DEFAULT,
+    'dry_run': False,
+    'log_level': 'info',
+    'force_push_latest': False,
+    'exclude_vcs_ignores': EXCLUDE_VCS_IGNORES_DEFAULT
+}
+
+# -- input matching these will update flags with the corresponding dict
+FLAGS_OPTIONS = {
+    '-q': {'quiet': True},
+    '--no-headers': {'headers': False},
+    '-v': {'verbose': True},
+    '-s': {'sort_targets': True},
+    '-d': {'dry_run': True},
+    '-f': {'force_push_latest': True}
+}
+
+# -- input matching these will become keyword args passed to the command
+# -- flags will steal (take precedence) for matching keywords
+NAMED_PARAMETER_OPTIONS = {
+    '--name': 'name',
+    '--freq': 'frequency',
+    '--budget': 'budget',
+    '-l': 'log_level',
+    '-o': 'order_by',
+    '--excludes': 'excludes'
+}
+
+BACKUP_HOME = f'{os.path.dirname(os.path.realpath(__file__))}'
 
 S3_BUCKET = None 
-BACKUP_HOME = f'{os.path.dirname(os.path.realpath(__file__))}'
 DATABASE_FILE = os.path.join(BACKUP_HOME, 'backups.db')
 WORKING_FOLDER = os.path.join(BACKUP_HOME, 'working')
-EXCLUDE_VCS_IGNORES = EXCLUDE_VCS_IGNORES_DEFAULT
 NO_SOLICIT = False 
+EXCLUDE_VCS_IGNORES = EXCLUDE_VCS_IGNORES_DEFAULT
 
 # -- config from file overwrites defaults 
 RCFILE = os.getenv('FRANKBACK_RC_FILE') or os.path.join(os.path.expanduser(f'~{os.getenv("USER")}'), '.frankbackrc')
@@ -99,24 +129,36 @@ class Results(object):
         print('\n\nResults:')
         print(json.dumps(self._results, indent=4))
 
+if not os.path.exists("/var/log/bckt"):
+    os.makedirs(os.path.join(os.path.sep, 'var', 'log', 'bckt'))
+
+logger = cowpy.getLogger()
+user_logger = cowpy.getLogger('user')
+
 class Backup(object):
     
+    logger = None 
+    user_logger = None
+
     db = None 
     awsclient = None 
 
     dry_run = None 
     verbose = False 
-    sort = False 
+    sort_targets = False 
     
     current_target = None 
 
     def __init__(self, *args, **kwargs):
+        
+        self.logger = kwargs['logger'] if 'logger' in kwargs else cowpy.getLogger()
+        self.user_logger = kwargs['user_logger'] if 'logger' in kwargs else cowpy.getLogger('user')
 
         if 'bucket_name' not in kwargs or kwargs['bucket_name'] == '':
             raise Exception("bucket_name must be supplied to Backup")
 
-        self.db = Database(logger=logger, db_file=DATABASE_FILE)
-        self.awsclient = AwsClient(bucket_name=kwargs['bucket_name'], db=self.db, logger=logger)
+        self.db = Database(logger=self.logger, db_file=DATABASE_FILE)
+        self.awsclient = AwsClient(bucket_name=kwargs['bucket_name'], db=self.db, logger=self.logger)
 
         for k in kwargs:
             setattr(self, k, kwargs[k])
@@ -137,6 +179,7 @@ class Backup(object):
         bckt target push <TARGET NAME>
         bckt archive list [TARGET NAME]
         bckt archive prune 
+        bckt archive aggressive-prune 
         bckt archive restore <ID>
         globals:
             set log level:  -l <LOG LEVEL>
@@ -159,6 +202,7 @@ class Backup(object):
             'archive list': self.print_archives,
             'archive last': self.print_last_archive,
             'archive prune': self.prune_archives,
+            'archive aggressive-prune': self.prune_archives_aggressively,
             'archive restore': self.restore_archive,
             'fixarchives': self.db.fix_archive_filenames,
             'help': self.print_help
@@ -168,7 +212,7 @@ class Backup(object):
         '''
         Print this help
         '''
-        
+
         for command in self.init_commands().keys():
             fn = self.init_commands()[command]
             sig = (' '.join(inspect.signature(fn).parameters.keys())).upper()
@@ -178,8 +222,8 @@ class Backup(object):
                 while doc.find('DOCDEFER') == 0:
                     doc_location = doc.split(':')[1]
                     doc = eval(doc_location).__doc__
-            logger.info(f'{command} {sig}')
-            logger.info(f'\t{doc}\n' if doc else '')
+            print(f'{command} {sig}')
+            print(f'\t{doc}\n' if doc else '')
     
     def command(self, positional_parameters, named_parameters):
 
@@ -199,7 +243,7 @@ class Backup(object):
         command = ""
         while True:
             if tokens > len(positional_parameters):
-                logger.error(f'The command {command} is not supported.')
+                self.user_logger.error(f'The command {command} is not supported.')
                 exit(1)    
             command = " ".join(positional_parameters[0:tokens])
             if command in self.init_commands().keys():
@@ -216,13 +260,21 @@ class Backup(object):
         try:
             fn(*args, **named_parameters)
         except:
-            logger.error(f'Please refer to help for "{command}"')
-            logger.error('Some common errors:')
-            logger.error('- unquoted strings with spaces')
-            logger.exception()
+            # self.logger.error(f'Please refer to help for "{command}"')
+            # self.logger.error('Some common errors:')
+            # self.logger.error('- unquoted strings with spaces')
+            self.logger.exception()
         
     def print_header(self):
-        logger.info(f'Date:\t\t{datetime.now()}\nUser:\t\t{os.getenv("USER", "unknown")}\nDatabase file:\t{DATABASE_FILE}\nRC File:\t{RCFILE}\nCommand:\t{" ".join(sys.argv)}\nWorking folder:\t{WORKING_FOLDER}\n\n*********begin output***********\n')
+        self.logger.info(f'\n\n\
+Date:\t\t{datetime.now()}\n\
+User:\t\t{os.getenv("USER", "unknown")}\n\
+Database file:\t{DATABASE_FILE}\n\
+RC File:\t{RCFILE}\n\
+Command:\t{" ".join(sys.argv)}\n\
+Working folder:\t{WORKING_FOLDER}\n\
+\n\
+*********begin output***********\n')
     
     def targets(self, target_name=None):
          targets = []
@@ -232,14 +284,16 @@ class Backup(object):
              if target:
                  targets.append(target)
          else:
-             targets = self.db.get_targets()
+             targets = self.db.get_targets()            
          
+         self.logger.debug(f'fetching remote stats on {len(targets)} targets')
          remote_stats = self.awsclient.get_remote_stats(targets)
+         self.logger.debug(f'stats fetched')
          
          for target in targets:
-             logger.set_context(target['name'])
+             self.logger.set_context(target['name'])
              yield target, remote_stats[target['name']]
-             logger.clear_context()
+             self.logger.clear_context()
             
     def initialize_database(self):
         '''DOCDEFER:Database.init_db'''
@@ -269,6 +323,10 @@ class Backup(object):
         '''Sets target active'''
         self.db.update_target(target_name, is_active=True)
 
+    def remove_marker_files(self, target):        
+        os.unlink(self.get_marker_path(target, 'pre'))
+        os.unlink(self.get_marker_path(target, 'post'))
+
     def get_marker_path(self, target, place):
         return os.path.join(os.path.realpath(os.path.join(target['path'], '..')), f'{target["name"]}_{place}_backup_marker')
 
@@ -290,40 +348,58 @@ class Backup(object):
         self.recreate_marker_file(post_marker)
 
     def target_has_new_files(self, target, log=True):
-
-        pre_marker = self.get_marker_path(target, 'pre')
+        
         has_new_files = False 
 
-        logger.debug(f'Determining if new files exist')
+        if log:
+            self.logger.debug(f'Determining if new files exist')
 
-        if os.path.exists(pre_marker):
-            try:
-                pre_marker_stat = shutil.os.stat(pre_marker)
+        try:
+            
+            pre_marker_date = target["pre_marker_at"]
+
+            if not pre_marker_date:
+                pre_marker_file = self.get_marker_path(target, 'pre')
+                pre_marker_stat = shutil.os.stat(pre_marker_file)            
                 pre_marker_date = datetime.fromtimestamp(pre_marker_stat.st_mtime)
+
+                if pre_marker_date and not target["pre_marker_at"]:
+                    self.db.update_target(target["name"], pre_marker_at=pre_marker_date)
+                    self.remove_marker_files(target)
+
+            if pre_marker_date:
+
                 pre_marker_stamp = datetime.strftime(pre_marker_date, "%c")
 
                 # -- verify an archive actually exists corresponding to this pre-marker file
                 marker_archive = self.db.get_archive_for_pre_timestamp(target['id'], pre_marker_date)
                 if not marker_archive:
                     if log:
-                        logger.warning(f'No archive exists corresponding to the existing pre-marker. This marker is invalid, and all files are considered new.')
+                        self.logger.warning(f'No archive exists corresponding to the existing pre-marker. This marker is invalid, and all files are considered new.')
                     has_new_files = True 
                 else:
-                    
-                    cp = subprocess.run(f'find {target["path"]} -newer {pre_marker}'.split(' '), check=True, capture_output=True)
+
+                    since_pre_minutes = (datetime.utcnow() - pre_marker_date).total_seconds() / 60.0    
+                    find_cmd = f'find {target["path"]} -mmin -{since_pre_minutes}'
+                    cp = subprocess.run(find_cmd.split(' '), check=True, capture_output=True)
+
+                    # cp = subprocess.run(f'find {target["path"]} -newer {pre_marker}'.split(' '), check=True, capture_output=True)
+
                     new_file_output = cp.stdout.splitlines()
                     new_file_count = len(new_file_output)
                     has_new_files = new_file_count > 0
                     if log:                        
-                        logger.info(f'{new_file_count} new files found since {pre_marker_stamp}')
-                        logger.debug(new_file_output)
-            except subprocess.CalledProcessError as cpe:
-                logger.error(cpe.stderr)   
-                traceback.print_tb(sys.exc_info()[2])
-        else:
-            has_new_files = True 
-            if log:
-                logger.warning(f'No marker file found, all files considered new')
+                        pre_marker_stamp = datetime.strftime(pre_marker_date, "%c")
+                        self.logger.info(f'{new_file_count} new files found since {pre_marker_stamp}')
+                        self.logger.debug(new_file_output)
+            else:
+                has_new_files = True 
+                if log:
+                    self.logger.warning(f'No pre-marker date found, all files considered new')        
+
+        except subprocess.CalledProcessError as cpe:
+            self.logger.error(cpe.stderr)   
+            traceback.print_tb(sys.exc_info()[2])
         
         return has_new_files
 
@@ -346,9 +422,9 @@ class Backup(object):
         archives = self.get_archives()
 
         if dry_run and not target:
-            logger.warning(f'Examining {len(targets)} targets to determine possible space made available by cleanup ({ "not " if not aggressive else "" }aggressive).')
+            self.logger.warning(f'Examining {len(targets)} targets to determine possible space made available by cleanup ({ "not " if not aggressive else "" }aggressive).')
         
-        logger.debug(f'creating cleanup-by-target tracking dict from {len(targets)} targets')
+        self.logger.debug(f'creating cleanup-by-target tracking dict from {len(targets)} targets')
         
         cleaned_up_by_target = { t["name"]: 0 for t in targets }
 
@@ -362,39 +438,50 @@ class Backup(object):
             found = 0
 
             if dry_run and target:
-                logger.warning(f'Examining {len(archives_newest_first)} ({target["name"]}) archives to determine possible space made available by cleanup ({ "not " if not aggressive else "" }aggressive).')
+                self.logger.warning(f'Examining {len(archives_newest_first)} ({target["name"]}) archives to determine possible space made available by cleanup ({ "not " if not aggressive else "" }aggressive).')
         
             for archive in archives_newest_first:
 
-                marked = False 
-
+                cleaned_up_aggressively = False 
+                
+                # -- two places aggressive comes into play 
+                # -- 1. only aggressive will remove _all_ local archives for a target 
+                # -- as long as there is also a remote copy (non-aggressive will only 
+                # -- clean up to within "minimum to keep", allowing local copies even 
+                # -- if a remote copy exists)
+                # -- 2. aggressive will lower the "minimum to keep" from 3 to 1
+                # -- so non-aggressive will allow up to 3 local archives for each target 
+                # -- aggressive will potentially remove every local archive, as long 
+                # -- as at least one archive exists remotely 
+                # -- TODO: check that aggressive will in fact remove all local archives 
+                # -- it may be keeping one 
+                
                 if aggressive:
                     if archive['location'] == Location.LOCAL_AND_REMOTE:
                         cleaned_up_by_target[t['name']] += archive['size_kb']
-                        marked = True 
+                        cleaned_up_aggressively = True 
                         message = f'Archive {archive["name"]}/{archive["filename"]} is both remote and local. Deleting local copy.'
                         if dry_run:
-                            logger.warning(f'[ DRY RUN ] {message}')
+                            self.logger.warning(f'[ DRY RUN ] {message}')
                         else:
-                            logger.warning(message)
+                            self.logger.warning(message)
                             os.unlink(os.path.join(WORKING_FOLDER, archive["filename"]))            
 
-                if not marked and os.path.exists(os.path.join(WORKING_FOLDER, archive["filename"])):                
+                if not cleaned_up_aggressively and os.path.exists(os.path.join(WORKING_FOLDER, archive["filename"])):                
                     if found < minimum_to_keep:
                         message = f'Keeping newer file {archive["filename"]}'
                         if dry_run:
-                            logger.info(f'[ DRY RUN ] {message}')
+                            self.logger.info(f'[ DRY RUN ] {message}')
                         else:
-                            logger.info(message)
+                            self.logger.info(message)
                         found += 1
                     else:
                         cleaned_up_by_target[t['name']] += archive['size_kb']
-                        marked = True 
                         message = f'Deleting file {os.path.join(WORKING_FOLDER, archive["filename"])}'
                         if dry_run:
-                            logger.error(f'[ DRY RUN ] {message}')
+                            self.logger.error(f'[ DRY RUN ] {message}')
                         else:
-                            logger.error(message)
+                            self.logger.error(message)
                             os.unlink(os.path.join(WORKING_FOLDER, archive["filename"]))
         
         return cleaned_up_by_target[target['name']] if target else cleaned_up_by_target
@@ -402,20 +489,22 @@ class Backup(object):
     def _create_working_folder(self):
         if not os.path.isdir(WORKING_FOLDER):
             os.makedirs(WORKING_FOLDER)
-            logger.success(f'Created working folder: {WORKING_FOLDER}')
+            self.logger.success(f'Created working folder: {WORKING_FOLDER}')
             
     def add_archive(self, target_name, results=None):
-        '''Creates a new archive for the provided target name, bypassing the rest of the backup workflow (frequency, active status), however does account for delta-on-disk and honors budget constraints for remote storage'''
+        '''
+            Creates a new archive for the provided target name, assuming 
+            precursors (frequency, active status), however does account for delta-on-disk and 
+            honors budget constraints for remote storage
+        '''
         
         target = self.db.get_target(name=target_name)
         
         if not results:
             results = Results()
 
-        none_response = None
-
         if not self.target_has_new_files(target):
-            logger.warning(f'No new files. Skipping archive creation.')
+            self.logger.warning(f'No new files. Skipping archive creation.')
             results.log('no_new_files')
             return
             
@@ -424,7 +513,7 @@ class Backup(object):
         
         increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
         if increase > 0:
-            logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
+            self.logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
             # -- TODO: can put a limiter in here 
         
         self._create_working_folder()
@@ -435,28 +524,28 @@ class Backup(object):
             
             additional_space_needed = target_size - free_space
 
-            logger.error(f'This target is {human(additional_space_needed, "kb")} bigger than what is available on the filesystem.')
+            self.logger.error(f'This target is {human(additional_space_needed, "kb")} bigger than what is available on the filesystem.')
 
             space_freed_by_cleanup = self.cleanup_local_archives(aggressive=False, dry_run=True)
             space_sum = sum([ space_freed_by_cleanup[t] for t in space_freed_by_cleanup.keys() ])
 
             if space_sum < additional_space_needed:
 
-                logger.error(f'Even after cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
+                self.logger.error(f'Even after cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
 
                 space_freed_by_cleanup = self.cleanup_local_archives(aggressive=True, dry_run=True)
                 space_sum = sum([ space_freed_by_cleanup[t] for t in space_freed_by_cleanup.keys() ])
                 
                 if space_sum < additional_space_needed:
-                    logger.error(f'Even after aggressively cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
+                    self.logger.error(f'Even after aggressively cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
                     results.log('insufficient_space')
                     return 
                 else:
-                    logger.warning(f'Cleaning up old local archives aggressively will free {human(space_sum, "kb")}. Proceeding with cleanup.')
+                    self.logger.warning(f'Cleaning up old local archives aggressively will free {human(space_sum, "kb")}. Proceeding with cleanup.')
                     space_freed_by_cleanup = self.cleanup_local_archives(aggressive=True, dry_run=self.dry_run)
             else:
 
-                logger.warning(f'Cleaning up old local archives will free {human(space_sum, "kb")}. Proceeding with cleanup.')
+                self.logger.warning(f'Cleaning up old local archives will free {human(space_sum, "kb")}. Proceeding with cleanup.')
                 self.cleanup_local_archives(aggressive=False, dry_run=self.dry_run)
         
         new_archive_id = None 
@@ -464,7 +553,7 @@ class Backup(object):
         try:
                 
             target_file = f'{WORKING_FOLDER}/{target["name"]}_{datetime.strftime(datetime.now(), "%Y%m%d_%H%M%S")}.tar.gz'
-            logger.info(f'Creating archive for {target["name"]}: {target_file}')
+            self.logger.info(f'Creating archive for {target["name"]}: {target_file}')
 
             excludes = ""
             if target["excludes"] and len(target["excludes"]) > 0:
@@ -475,25 +564,25 @@ class Backup(object):
             if self.exclude_vcs_ignores:
                 archive_command = f'tar {excludes} --exclude-vcs-ignores -czf {target_file} {target["path"]}'
                 
-            logger.info(f'Running archive command: {archive_command}')
+            self.logger.info(f'Running archive command: {archive_command}')
 
             # -- strip off microseconds as this is lost when creating the marker file and will prevent the assocation with the archive record
             pre_timestamp = datetime.strptime(datetime.strftime(datetime.now(), "%Y-%m-%d %H:%M:%S"), "%Y-%m-%d %H:%M:%S")
 
             cp = subprocess.run(archive_command.split(' '), capture_output=True)
-            logger.warning(cp.args)            
-            logger.warning(f'Archive returncode: {cp.returncode}')
+            self.logger.warning(cp.args)            
+            self.logger.warning(f'Archive returncode: {cp.returncode}')
             if cp.stdout:
-                logger.warning(cp.stdout)
+                self.logger.warning(cp.stdout)
             if cp.stderr:
-                logger.error(cp.stderr)
+                self.logger.error(cp.stderr)
             archive_errors = str(cp.stderr)
 
             cp = subprocess.run(f'tar --test-label -f {target_file}'.split(' '), capture_output=True)
-            logger.warning(cp.args)
-            logger.warning(f'Archive test returncode: {cp.returncode}')
+            self.logger.warning(cp.args)
+            self.logger.warning(f'Archive test returncode: {cp.returncode}')
             if cp.stderr:
-                logger.error(cp.stderr)
+                self.logger.error(cp.stderr)
             
             cp.check_returncode()
 
@@ -502,16 +591,24 @@ class Backup(object):
                 raise Exception("Insufficient space while archiving. Archive target file (assumed partial) will be deleted. Please clean up the disk and reschedule this target as soon as possible.")
             
             target_file_stat = shutil.os.stat(target_file)
-            new_archive_id = self.db.create_archive(target_id=target['id'], size_kb=target_file_stat.st_size/1024.0, filename=target_file, returncode=cp.returncode, errors=archive_errors, pre_marker_timestamp=pre_timestamp)
+            
+            new_archive_id = self.db.create_archive(
+                target_id=target['id'], 
+                size_kb=target_file_stat.st_size/1024.0, 
+                filename=target_file, 
+                returncode=cp.returncode, 
+                errors=archive_errors, 
+                pre_marker_timestamp=pre_timestamp)
+            
             self.update_markers(target, pre_timestamp)
             results.log('archive_created')
             
-            logger.success(f'Archive record {new_archive_id} created for {target_file}')
+            self.logger.success(f'Archive record {new_archive_id} created for {target_file}')
             
             if target_file:
-                logger.success(f'Created {target["name"]} archive: {target_file}')
+                self.logger.success(f'Created {target["name"]} archive: {target_file}')
             else:
-                logger.warning(f'No {target["name"]} archive created')
+                self.logger.warning(f'No {target["name"]} archive created')
 
         except:
             # -- maybe roll back any changes if not past a certain point 
@@ -524,85 +621,88 @@ class Backup(object):
             #   rollback:
             #       if archive record fails, don't delete from s3 because the remaining days will only be prorated 
 
-            logger.exception()
+            self.logger.exception()
 
             if new_archive_id:
-                logger.error(f'Removing archive record {new_archive_id}')
+                self.logger.error(f'Removing archive record {new_archive_id}')
                 self.db.delete_archive(new_archive_id)
             if os.path.exists(target_file):
-                logger.error(f'Removing archive file {target_file}')
+                self.logger.error(f'Removing archive file {target_file}')
                 os.unlink(target_file)
     
-    def push_target_latest(self, target_name=None):
+    def push_target_latest(self, target_name):
         '''Pushes latest target archive remotely, if not already remote. Honors budget/time constraints by default, so usually used with -p (force push latest). If target name not provided, acts on all targets.'''
         
         for target, remote_stats in self.targets(target_name):
             
             last_archive = self.db.get_last_archive(target['id'])
             if last_archive and not last_archive['is_remote']:
-                logger.warning(f'Last archive is not pushed remotely')
+                self.logger.warning(f'Last archive is not pushed remotely')
 
                 if target['is_active']:
-                    self.awsclient.cleanup_remote_archives(remote_stats, dry_run=self.dry_run)
+                    # -- no, we do not want to automatically delete anything older than 6 months
+                    # -- before confirming if anything will be pushed up to replace it, ever
+                    self.awsclient.cleanup_remote_archives(target_name, remote_stats, dry_run=True)
                 else:
-                    logger.warning(f'Not cleaning remote archives (is_active={target["is_active"]})')
+                    self.logger.warning(f'Not cleaning remote archives (is_active={target["is_active"]})')
 
                 if self.force_push_latest or self.awsclient.is_push_due(target, remote_stats=remote_stats):
                     try:
                         if target['is_active']:
                             archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
-                            logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
+                            self.logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
                             if not self.dry_run:
                                 self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
-                            logger.success(f'Last archive has been pushed remotely')                        
+                            self.logger.success(f'Last archive has been pushed remotely')                        
                             if not self.dry_run:
                                 self.db.set_archive_remote(last_archive)
                         else:
-                            logger.warning(f'Not pushing remote (is_active={target["is_active"]})')
+                            self.logger.warning(f'Not pushing remote (is_active={target["is_active"]})')
                     except:
-                        logger.error(f'The last archive failed to push remotely')
-                        logger.error(sys.exc_info()[1])
+                        self.logger.error(f'The last archive failed to push remotely')
+                        self.logger.error(sys.exc_info()[1])
                         traceback.print_tb(sys.exc_info()[2])
             elif not last_archive:
-                logger.warning(f'No last archive is available for this target')
+                self.logger.warning(f'No last archive is available for this target')
             elif last_archive['is_remote']:
-                logger.info(f'The last archive is already pushed remotely')
+                self.logger.info(f'The last archive is already pushed remotely')
     
     def restore_archive(self, archive_id):
         '''Unpacks the archive identified by the ID provided into WORKING_FOLDER/restore/<target name>/<archive filename base>'''
         
         archive_record = self.db.get_archive(archive_id)
         if not archive_record:
-            logger.warning(f'Archive {archive_id} was not found')
+            self.logger.warning(f'Archive {archive_id} was not found')
             return 
 
         location = self.get_archive_location(archive_record)
         if location in [Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY, Location.LOCAL_REMOTE_UNKNOWN]:
-            logger.info(f'Archive {archive_record["filename"]} is local, proceeding to unarchive.')
+            self.logger.info(f'Archive {archive_record["filename"]} is local, proceeding to unarchive.')
             filenamebase = archive_record["filename"].split('.')[0]
             archive_path = f'{WORKING_FOLDER}/{archive_record["filename"]}'
             unarchive_folder = f'{WORKING_FOLDER}/restore/{archive_record["name"]}/{filenamebase}'
-            logger.info(f'Unarchiving into {unarchive_folder}')
+            self.logger.info(f'Unarchiving into {unarchive_folder}')
             os.makedirs(unarchive_folder)
             unarchive_command = f'tar -xzf {archive_path} -C {unarchive_folder}'
             cp = subprocess.run(unarchive_command.split(' '), capture_output=True)
-            logger.warning(cp.args)
-            logger.warning(f'Archive returncode: {cp.returncode}')
-            logger.warning(cp.stdout)
-            logger.error(cp.stderr)
+            self.logger.warning(cp.args)
+            self.logger.warning(f'Archive returncode: {cp.returncode}')
+            self.logger.warning(cp.stdout)
+            self.logger.error(cp.stderr)
 
     ### other operations 
 
     def get_archives(self, target_name=None):
         db_records = self.db.get_archives(target_name)        
-        s3_objects = self.awsclient.get_remote_archives()
-        s3_objects_by_filename = { os.path.basename(obj.key): obj for obj in s3_objects }    
+        s3_objects = self.awsclient.get_remote_archives(target_name)
+        self.logger.debug(f'Have {len(db_records)} database records and {len(list(s3_objects))} S3 objects')
+        s3_objects_by_filename = { os.path.basename(obj['key']): obj for obj in s3_objects }    
         for record in db_records:
             record['location'] = self.get_archive_location(record, s3_objects_by_filename)
         return db_records
 
     def target_is_scheduled(self, target):
-        '''Reports true/false based on target.frequency and existence/timestamp of last archive'''
+        '''Reports true/false based on target.frequency and existence/timestamp of last archive, NOT existence of new files'''
 
         frequency = target['frequency']
         frequency_minutes = frequency_to_minutes(frequency)
@@ -614,6 +714,26 @@ class Backup(object):
         else:
             is_scheduled = True 
         return is_scheduled
+    
+    def get_blank_target(self):
+        return {
+            'name': '-',
+            'is_active': '-',
+            'path': '-',
+            'excludes': '-',
+            'uncompressed_kb': '-',
+            'last_archive_size': '-',
+            'frequency': '-',
+            'cycles_behind': '-',
+            'last_archive_at': '-',
+            'has_new_files': '-',
+            'would_push': '-',
+            'push_strategy': '-',
+            'monthly_cost': '-',
+            'budget_max': '-',
+            'local_archive_count': '-',
+            'remote_archive_count': '-'
+        }
 
     def print_targets(self, target_name=None):
 
@@ -627,31 +747,38 @@ class Backup(object):
 
         target_print_items = []
         archives_by_target_and_location = {}
-        
+        total_last_archive_size_kb = 0
+
         for target_print_item, remote_stats in self.targets(target_name):
             
             # -- target name, path, budget max, frequency, total archive count, % archives remote, last archive date/days, next archive date/days
+            time_out = datetime.now()
             archives = self.get_archives(target_print_item['name'])
-            
-            logger.debug(f'have {len(archives)} archives for {target_print_item["name"]}')
+            time_in = datetime.now()
+            self.logger.debug(f'archive fetch time: {"%.1f" % (time_in - time_out).total_seconds()} seconds')
+
+            self.logger.debug(f'have {len(archives)} archives for {target_print_item["name"]}')
             
             if target_print_item['id'] not in archives_by_target_and_location:
                 archives_by_target_and_location[target_print_item['id']] = {'local': [], 'remote': [] }
-                
-            for archive in archives:
-                if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
-                    archives_by_target_and_location[archive['target_id']]['local'].append(archive)
-                if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.REMOTE_ONLY ]:
-                    archives_by_target_and_location[archive['target_id']]['remote'].append(archive)
+            
+            archives_by_target_and_location[target_print_item['id']]['local'] = [ a for a in archives if a['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ] ]
+            archives_by_target_and_location[target_print_item['id']]['remote'] = [ a for a in archives if a['location'] in [ Location.LOCAL_AND_REMOTE, Location.REMOTE_ONLY ] ]
+
+            # for archive in archives:
+            #     if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
+            #         archives_by_target_and_location[archive['target_id']]['local'].append(archive)
+            #     if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.REMOTE_ONLY ]:
+            #         archives_by_target_and_location[archive['target_id']]['remote'].append(archive)
                     
             # target_print_item = copy.copy(target)
 
-            logger.debug(f'analyzing {target_print_item["name"]}')
+            self.logger.debug(f'analyzing {target_print_item["name"]}')
             
             target_print_item['has_new_files'] = '-'
 
             if self.verbose and target_print_item['is_active']:
-                target_print_item['has_new_files'] = self.target_has_new_files(target_print_item, log=False)
+                target_print_item['has_new_files'] = self.target_has_new_files(target_print_item, log=True)
 
             target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target_print_item['id'] }
             
@@ -682,6 +809,7 @@ class Backup(object):
                 target_print_item['last_archive_at'] = time_since(minutes_since_last_archive)
                 target_print_item['last_archive_pushed'] = last_archive['is_remote']
                 target_print_item['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
+                total_last_archive_size_kb += last_archive['size_kb']
             
             
             if self.verbose and target_print_item['is_active']:
@@ -691,11 +819,13 @@ class Backup(object):
 
             target_print_item['local_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['local'])
             target_print_item['remote_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['remote'])
-            target_print_item['monthly_cost'] = smart_precision(sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ]))
+            target_storage_cost_sum = sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item['id']]['remote'] ])
+            self.logger.debug(f'{target_print_item["name"]} storage cost sum: {target_storage_cost_sum}')
+            target_print_item['monthly_cost'] = smart_precision(target_storage_cost_sum)
 
             target_print_items.append(target_print_item)
-        
-        logger.debug(json.dumps(target_print_items, indent=4))
+                
+        # self.logger.debug(json.dumps(target_print_items, indent=4))
         
         target_columns = [
             {
@@ -767,7 +897,7 @@ class Backup(object):
         
         sorted_target_print_items = sorted(target_print_items, key=lambda t: t['path'])
 
-        if self.sort:
+        if self.sort_targets:
             if self.verbose:
                 sorted_target_print_items = sorted(target_print_items, key=lambda t: not stob(t['would_push']))
                 sorted_target_print_items = sorted(sorted_target_print_items, key=lambda t: not stob(t['has_new_files']))
@@ -792,32 +922,36 @@ class Backup(object):
         # -- unless the column specifies trunc: False 
         table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and not self.verbose and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
 
-        c = Columnizer(logger=logger, **flag_args)
+        c = Columnizer(logger=self.logger, **flag_args)
         c.print(table, header, highlight_template=highlight_template, data=True)
+        print(f'Total current backup size: {(total_last_archive_size_kb/(1024*1024)):.2f} GB')
 
     def get_archive_location(self, archive, remote_file_map=None):
         basename = os.path.basename(archive["filename"])
         local_file_exists = os.path.exists(os.path.join(WORKING_FOLDER, archive["filename"]))
         remote_file_exists = remote_file_map and basename in remote_file_map
-        
+        location = Location.DOES_NOT_EXIST
+
         if local_file_exists and remote_file_exists:
-            return Location.LOCAL_AND_REMOTE
+            location = Location.LOCAL_AND_REMOTE
         elif local_file_exists and remote_file_map:
-            return Location.LOCAL_ONLY
+            location = Location.LOCAL_ONLY
         elif remote_file_exists:
-            return Location.REMOTE_ONLY
+            location = Location.REMOTE_ONLY
         elif local_file_exists and not remote_file_map:
-            return Location.LOCAL_REMOTE_UNKNOWN
-        return Location.DOES_NOT_EXIST
+            location = Location.LOCAL_REMOTE_UNKNOWN
+        
+        # self.logger.debug(f'Location: {location}')
+        return location 
 
     def _get_archives_for_target(self, target_name=None):
         
         db_records = self.db.get_archives(target_name)
 
-        logger.debug(db_records)
+        self.logger.debug(db_records)
 
         s3_objects = self.awsclient.get_remote_archives(target_name)
-        s3_objects_by_filename = { os.path.basename(obj.key): obj for obj in s3_objects }    
+        s3_objects_by_filename = { os.path.basename(obj['key']): obj for obj in s3_objects }    
 
         archive_display = []
 
@@ -838,16 +972,18 @@ class Backup(object):
             if basename in s3_objects_by_filename:
                 del s3_objects_by_filename[basename]
         
+        # -- at this point, s3_objects_by_filename has been cleaned of everything with a DB representation
+        # -- only orphans left 
         for orphaned_s3_object_filename in s3_objects_by_filename:
             obj = s3_objects_by_filename[orphaned_s3_object_filename]
 
             archive_display.append({ 
                 'id': None, 
-                'filename': obj.key, 
-                'created_at': obj.last_modified, 
-                'size_mb': "%.1f" % (obj.size/(1024.0*1024.0)), 
+                'filename': obj['key'], 
+                'created_at': obj['last_modified'], 
+                'size_mb': "%.1f" % (obj['size']/(1024.0*1024.0)), 
                 'location': Location.REMOTE_ONLY, 
-                's3_cost_per_month': "%.4f" % self.awsclient.get_object_storage_cost_per_month(obj.size) 
+                's3_cost_per_month': "%.4f" % self.awsclient.get_object_storage_cost_per_month(obj['size']) 
             })
 
             if not target_name:
@@ -855,17 +991,37 @@ class Backup(object):
         
         #total_cost = sum([ float(a['s3_cost_per_month'])  for a in archive_display ])
         
+        # -- filter out DNE
         archive_display = [ a for a in archive_display if a['location'] != Location.DOES_NOT_EXIST ]
+        
+        archive_list_filter = {
+            #'location': Location.LOCAL_ONLY
+        }
+
+        archive_list_sort = {
+            'size_mb': {
+                'fn': lambda a: float(a['size_mb']),
+                'dir': 'desc'
+            }
+        }
+
+        for f_key in archive_list_filter:
+            archive_display = [ a for a in archive_display if a[f_key] == archive_list_filter[f_key] ]
+        
+        for s_key in archive_list_sort:
+            archive_display = sorted(archive_display, key=archive_list_sort[s_key]['fn'], reverse=archive_list_sort[s_key]['dir'] == 'desc')
         
         table = []
         header = []
         
         if len(archive_display) == 0:
-            logger.warning(f'No archives found for target.')
+            self.logger.warning(f'No archives found for target.')
         else:
+            # -- when not showing for a specific target, include target name
             if not target_name:
                 table = [ [ archive["id"], archive["target_name"], archive["filename"], archive["created_at"], archive["size_mb"], archive["location"], archive["s3_cost_per_month"] ] for archive in archive_display ]
                 header = ['id','target_name', 'filename','created_at','size_mb','location','$/month']
+            # -- when showing for a specific target, no need for target name 
             else:
                 table = [ [ archive["id"], archive["filename"], archive["created_at"], archive["size_mb"], archive["location"], archive["s3_cost_per_month"] ] for archive in archive_display ]
                 header = ['id','filename','created_at','size_mb','location','$/month']
@@ -879,7 +1035,7 @@ class Backup(object):
         rows = [ dict(zip(header, row)) for row in table ]
         for row in rows:
             if row['location'] != Location.DOES_NOT_EXIST:
-                logger.text(row['filename'], data=True)
+                logger.text(row['filename'])
                 break 
 
     def print_archives(self, target_name=None):
@@ -887,7 +1043,7 @@ class Backup(object):
 
         table, header = self._get_archives_for_target(target_name)
 
-        c = Columnizer(logger=logger, cell_padding=5, header_color='white', row_color='orange', **flag_args)
+        c = Columnizer(logger=self.logger, cell_padding=5, header_color='white', row_color='orange', **flag_args)
         c.print(table, header, data=True)
 
     def prune_archives(self, target_name=None):
@@ -897,6 +1053,14 @@ class Backup(object):
             target = self.db.get_target(name=target_name)
 
         self.cleanup_local_archives(target=target, aggressive=False, dry_run=self.dry_run)
+    
+    def prune_archives_aggressively(self, target_name=None):
+
+        target = None 
+        if target_name:
+            target = self.db.get_target(name=target_name)
+
+        self.cleanup_local_archives(target=target, aggressive=True, dry_run=self.dry_run)
 
     def run(self, target_name=None):
         '''
@@ -912,7 +1076,7 @@ class Backup(object):
 
         start = datetime.now()
 
-        logger.info(f'\nBackup run: {datetime.strftime(start, "%c")}')
+        self.logger.info(f'\nBackup run: {datetime.strftime(start, "%c")}')
 
         results = Results()
 
@@ -924,13 +1088,13 @@ class Backup(object):
                 if target['is_active'] and is_scheduled:                    
                     self.add_archive(target["name"], results)
                 else:
-                    logger.warning(f'Not running {target["name"]} (scheduled={is_scheduled}, active={target["is_active"]})')
+                    self.logger.warning(f'Not running {target["name"]} (scheduled={is_scheduled}, active={target["is_active"]})')
                     if not target["is_active"]:
                         results.log('not_active')
                     if not is_scheduled:
                         results.log('not_scheduled')
             except:
-                logger.exception()
+                self.logger.exception()
 
             try:
                 '''
@@ -947,7 +1111,7 @@ class Backup(object):
                 '''
                 self.push_target_latest(target['name'])
             except:
-                logger.exception()
+                self.logger.exception()
             
             # -- check S3 status (regardless of schedule)
             # -- check target budget (calculate )
@@ -959,66 +1123,38 @@ class Backup(object):
 
         results.print()
 
-        logger.info(f'\n\nBackup run completed: {datetime.strftime(end, "%c")}\n')
+        self.logger.info(f'\n\nBackup run completed: {datetime.strftime(end, "%c")}\n')
 
 def parse_flags():
     ''' Separate sys.argv into flags updates, actually make those updates and return everything else '''
 
-    # -- this is the default template to be updated by matching input below 
-    # -- it will be passed as keyword args to logging and the main backup class 
-    flags = {
-        'quiet': LOGGER_QUIET_DEFAULT,
-        'headers': LOGGER_HEADERS_DEFAULT,
-        'verbose': VERBOSE_DEFAULT,
-        'sort': SORT_DEFAULT,
-        'dry_run': DRY_RUN_DEFAULT,
-        'log_level': LOG_LEVEL_DEFAULT,
-        'force_push_latest': FORCE_PUSH_LATEST_DEFAULT,
-        'exclude_vcs_ignores': EXCLUDE_VCS_IGNORES
-    }
-    
-    # -- input matching these will update flags with the corresponding dict
-    flags_options = {
-        '-q': {'quiet': True},
-        '--no-headers': {'headers': False},
-        '-v': {'verbose': True},
-        '-s': {'sort': True},
-        '-d': {'dry_run': True},
-        '-p': {'force_push_latest': True}
-    }
-
-    # -- input matching these will become keyword args passed to the command
-    # -- flags will steal (take precedence) for matching keywords
-    named_parameter_options = {
-        '-n': 'name',
-        '-f': 'frequency',
-        '-b': 'budget',
-        '-l': 'log_level',
-        '-e': 'excludes'
-    }
-    
     named_parameters = {}
     positional_parameters = []
     skip_next = False 
-
+    flag_args = {**FLAGS}
+    
     for i, arg in enumerate(sys.argv[1:], 1):
+        
         if skip_next:
             skip_next = False 
             continue 
-        if arg in flags_options:
-            flags.update(flags_options[arg])
-        elif arg in named_parameter_options:
-            named_parameter_name = named_parameter_options[arg]
+
+        if arg in FLAGS_OPTIONS:
+            flag_args.update(FLAGS_OPTIONS[arg])
+        elif arg in NAMED_PARAMETER_OPTIONS:
+            named_parameter_name = NAMED_PARAMETER_OPTIONS[arg]
             new_parameter = {named_parameter_name: sys.argv[i+1]}
-            if named_parameter_name in flags.keys():
-                flags.update(new_parameter)
-            else:
-                named_parameters.update(new_parameter)
             skip_next = True
+            # -- a named parameter will first try to set FLAGS with whatever is passed 
+            if named_parameter_name in flag_args.keys():
+                flag_args.update(new_parameter)
+            else:
+                # -- but if no flag matches, we get a named parameter
+                named_parameters.update(new_parameter)            
         else:
             positional_parameters.append(arg)
     
-    return flags, positional_parameters, named_parameters
+    return flag_args, positional_parameters, named_parameters
 
 def solicit():
     if NO_SOLICIT:
@@ -1049,13 +1185,13 @@ if __name__ == "__main__":
     
     flag_args, positional_parameters, named_parameters = parse_flags()
         
-    logger = FrankLogger(**flag_args)
+    # logger = FrankLogger(**flag_args)
 
     if not S3_BUCKET or not DATABASE_FILE or not WORKING_FOLDER:
         logger.error(f'S3_BUCKET, DATABASE_FILE and WORKING_FOLDER must all be provided')
     
     solicit()
 
-    b = Backup(bucket_name=S3_BUCKET, **flag_args)
+    b = Backup(bucket_name=S3_BUCKET, logger=logger, user_logger=user_logger, **flag_args)
     b.command(positional_parameters, named_parameters)
     

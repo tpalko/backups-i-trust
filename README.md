@@ -2,6 +2,37 @@
 
 ## development
 
+2/3/23
+
+last archive GB doesn't show actual folder size, so we can't tell if space is a problem 
+why have 2022 pics not been archived in 153 days? 
+.MOV still being excluded from pics folders.. 
+need to move to not deep/cold glacier storage - more accessible.. maybe selectable per target.. or the bucket itself is selectable
+list archive shows a ton of 'remote only' archives.. is this accurate? are the #'s of local/remote on target list accurate?
+need a one-liner 'status' for the window manager action bar to show 1) most stale backup 2) reason for most stale backup failure 3) highest costing backup and maybe 4) most stale remote AND everywhere
+better --help, more standardized flags, manpage maybe 
+see last timestamp observed for each target 
+excludes to show - instead of None 
+maybe take another look at this columnizer thing.. use third party?
+
+6/28/22
+
+- internalize /var/log logging (not wrapped in shell script)
+- get away from using marker files as timeline placeholders
+
+5/11/22
+
+- track archive size, on disk size, average compression rate, and use this instead of size on disk for space + cost calculations 
+- fix s3 pull, do we need to code in object restore with boto, deep archive storage requires restore init 
+- include start/stop timings in header/post-header?
+
+5/3/22
+
+`version-py.js` and `.versionrc.js` also probably related to `standard-version` supporting `setup.cfg`
+as a bump target.
+
+Should have a `.frankbackrc` sample file, and document `FRANKBACK_RC_FILE` usage.
+
 3/5/22
 
 needs work for situational awareness 

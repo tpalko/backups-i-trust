@@ -47,11 +47,13 @@ class FrankLogger(object):
 
         self.logger = logging.getLogger(__file__)
         self.logger.setLevel(logging._nameToLevel[self.log_level.upper()])
-        self.logger.addHandler(logging.StreamHandler())        
+        self.logger.addHandler(logging.StreamHandler())
+        # log_filename = datetime.now()
+        # self.logger.addHandler(logging.FileHandler(f'/var/log/bckpsitrst/{log_filename}', mode='a'))
    
     def clear_context(self):
         self.context = None 
-        
+    
     def set_context(self, context):
         self.context = context 
     
@@ -116,11 +118,12 @@ UNITS = [
 def smart_precision(float_value):
     
     float_value_string = str(float_value)
+    
+    places = 3
+    
     # -- a hyphen will indicate the negative exponent of a python-formatted exponentially small number 2e-3 = 0.002 
     if float_value_string.find('-') >= 0:
         places = float_value_string.split('-')[1]
-    else:
-        places = 3
         
     return f'{float_value}:.{places}f'
 

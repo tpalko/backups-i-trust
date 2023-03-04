@@ -1,5 +1,11 @@
 __pycache__
 *.out
 dist
-terraform/.terraform*
-*.tfstate
+*.log
+.vscode
+local
+.terraform
+*.tfstate.backup
+.cache
+vendor
+working

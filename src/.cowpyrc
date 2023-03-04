@@ -1,0 +1,47 @@
+{
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+            'level': 'DEBUG'
+        },
+        'exception_handler': {
+            'class': 'logging.FileHandler',
+            'filename': '/var/log/bckt/bckt.err',
+            'level': 'WARNING'
+        },
+        'internal_logger': {
+            'class': 'logging.FileHandler',
+            'filename': '/var/log/bckt/bckt.log',
+            'level': 'DEBUG'
+        },
+    },
+    'loggers': {    
+        'jroutes': {
+            'handlers': ['internal_logger', 'exception_handler'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'cowpy': {
+            'handlers': ['internal_logger', 'exception_handler'],
+            'level': 'WARNING',
+            'propagate': False,
+        },
+        'botocore': {
+            'handlers': ['internal_logger', 'exception_handler'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'bckt': {
+            'handlers': ['internal_logger', 'exception_handler'],
+            'level': 'DEBUG',
+            'propagate': False,
+        },
+        'user': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
+        }
+    }
+}

@@ -9,12 +9,12 @@ from awsclient import PushStrategy
 
 _TABLES = {
     'archives': '(id integer primary key autoincrement, target_id int, created_at datetime, size_kb int, is_remote bool, remote_push_at datetime, filename char(255), returncode int, errors text, pre_marker_timestamp datetime, md5 char(32))',
-    'targets': '(id integer primary key autoincrement, path text, name char(255), excludes text, budget_max float, frequency char(32), push_strategy char(32), push_period int, is_active bool)',
+    'targets': '(id integer primary key autoincrement, path text, name char(255), excludes text, budget_max float, frequency char(32), push_strategy char(32), push_period int, is_active bool, pre_marker_at datetime, post_marker_at datetime)',
     'runs': '(id integer primary key autoincrement, start_at datetime, end_at datetime, run_stats_json text)'
 }
 ARCHIVE_TARGET_JOIN_SELECT = 'a.id, a.target_id, a.created_at, a.size_kb, a.is_remote, a.remote_push_at, a.filename, a.returncode, a.errors, a.pre_marker_timestamp, a.md5, t.name, t.path, t.is_active'
 ARCHIVE_TARGET_JOIN = 'from archives a inner join targets t on t.id = a.target_id'
-TARGETS_SELECT = 't.id, t.path, t.name, t.excludes, t.budget_max, t.frequency, t.push_strategy, t.push_period, t.is_active'
+TARGETS_SELECT = 't.id, t.path, t.name, t.excludes, t.budget_max, t.frequency, t.push_strategy, t.push_period, t.is_active, t.pre_marker_at, t.post_marker_at'
 
 class Database(object):
 
@@ -36,7 +36,12 @@ class Database(object):
     def parse_type(self, column_name, value):
         if value is not None:
             if column_name[-3:] == '_at':
-                return datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f")
+                parsed = value 
+                try:
+                    parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S.%f")
+                except:
+                    parsed = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+                return parsed
             elif column_name[0:3] == 'is_':
                 return bool(value)
         return value 
@@ -126,7 +131,10 @@ class Database(object):
     def get_archive_for_pre_timestamp(self, target_id, timestamp):
         line = None 
         with self.cursor() as c:
-            c.execute(f'select {ARCHIVE_TARGET_JOIN_SELECT} {ARCHIVE_TARGET_JOIN} where a.target_id = ? and a.pre_marker_timestamp = ? order by created_at desc limit 1', (target_id, timestamp))
+            c.execute(f'select {ARCHIVE_TARGET_JOIN_SELECT} {ARCHIVE_TARGET_JOIN} \
+                      where a.target_id = ? \
+                      and a.pre_marker_timestamp = ? \
+                      order by created_at desc limit 1', (target_id, timestamp))
             line = c.fetchone()
         return line
 
@@ -169,7 +177,7 @@ class Database(object):
             db_command = f'select {TARGETS_SELECT} from targets t'
             self.logger.debug(db_command)
             c.execute(db_command)
-            all_targets = c.fetchall()
+            all_targets = c.fetchall()            
         return all_targets        
 
     def get_target(self, name):
