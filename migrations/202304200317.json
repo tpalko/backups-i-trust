@@ -1,0 +1,5 @@
+{
+    "name":"202304200317",
+    "up": "alter table targets add column last_reason text",
+    "down": "BEGIN; CREATE TABLE targets_temp as select id, path, name, excludes, budget_max, frequency, push_strategy, push_period, is_active, pre_marker_at, post_marker_at from targets; DROP TABLE targets; ALTER TABLE targets_temp RENAME TO targets; END TRANSACTION;"
+}

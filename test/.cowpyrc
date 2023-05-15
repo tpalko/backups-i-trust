@@ -1,4 +1,6 @@
 {
+    'version': 1,
+    'disable_existing_loggers': False,
     'formatters': {
         'user': {
             'format': '%(message)s'
@@ -16,12 +18,12 @@
         },
         'exception_handler': {
             'class': 'logging.FileHandler',
-            'filename': './test/bckt.err',
+            'filename': 'bckt.err',
             'level': 'WARNING'
         },
         'internal_logger': {
             'class': 'logging.FileHandler',
-            'filename': './test/bckt.log',
+            'filename': 'bckt.log',
             'level': 'DEBUG'
         },
     },
@@ -29,30 +31,37 @@
         'botocore': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'INFO',
-        },        
+            'propagate': False,
+        },
         '__init__': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'INFO',
+            'propagate': False,
         },
         'bckt': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
+            'propagate': False,
         },
-        'bcktdb': {
+        'Database': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
+            'propagate': False,
         },
-        'awsclient': {
+        'AwsClient': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
+            'propagate': False,
         },
-        'columnizer': {
+        'Columnizer': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
+            'propagate': False,
         },
         'user': {
             'handlers': ['user_console'],
             'level': 'DEBUG',
+            'propagate': False,
         }
     }
 }

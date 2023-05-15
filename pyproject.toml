@@ -1,3 +1,30 @@
+[metadata]
+name = "bckt"
+version = "v0.0.1"
+author = "Tim Palko"
+author_email = "tim@palkosoftware.com"
+description = "Budget-focused cloud-targeted file backup and restore command-line tool"
+readme = "README.md"
+url = "https://github.com/tpalko/backups-i-trust"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: GNUv3 License",
+    "Operating System :: OS Independent"
+]
+requires-python = ">=3.9"
+
+[options]
+python_requires = ">=3.9"
+
+[options.entry_points.console_scripts]
+bckt = "backup:main"
+
+[options.packages.find]
+where = "src"
+
 [build-system]
-requires = ["setuptools>=42"]
+requires = [
+    "setuptools>=42",
+    "wheel"
+]
 build-backend = "setuptools.build_meta"

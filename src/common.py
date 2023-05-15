@@ -1,9 +1,6 @@
-import traceback 
-import sys 
 import subprocess 
 import math
 from enum import Enum 
-import logging 
 
 FOREGROUND_COLOR_PREFIX = '\033[38;2;'
 FOREGROUND_COLOR_SUFFIX = 'm'
@@ -31,74 +28,74 @@ COLOR_TABLE = {
 def colorwrapper(text, color):
     return f'{FOREGROUND_COLOR_PREFIX}{COLOR_TABLE[color]}{FOREGROUND_COLOR_SUFFIX}{text}{FOREGROUND_COLOR_RESET}'
 
-class FrankLogger(object):
+# class FrankLogger(object):
     
-    logger = None 
+#     logger = None 
 
-    quiet = False 
-    headers = True 
-    log_level = None 
-    context = None 
-    dry_run = False 
+#     quiet = False 
+#     headers = True 
+#     log_level = None 
+#     context = None 
+#     dry_run = False 
     
-    def __init__(self, *args, **kwargs):
-        for k in [ p for p in kwargs if p in dir(self) ]:
-            self.__setattr__(k, kwargs[k])
+#     def __init__(self, *args, **kwargs):
+#         for k in [ p for p in kwargs if p in dir(self) ]:
+#             self.__setattr__(k, kwargs[k])
 
-        self.logger = logging.getLogger(__file__)
-        self.logger.setLevel(logging._nameToLevel[self.log_level.upper()])
-        self.logger.addHandler(logging.StreamHandler())
-        # log_filename = datetime.now()
-        # self.logger.addHandler(logging.FileHandler(f'/var/log/bckpsitrst/{log_filename}', mode='a'))
+#         self.logger = cowpy.getLogger() # logging.getLogger(__file__)
+#         # self.logger.setLevel(logging._nameToLevel[self.log_level.upper()])
+#         # self.logger.addHandler(logging.StreamHandler())
+#         # log_filename = datetime.now()
+#         # self.logger.addHandler(logging.FileHandler(f'/var/log/bckpsitrst/{log_filename}', mode='a'))
    
-    def clear_context(self):
-        self.context = None 
+#     def clear_context(self):
+#         self.context = None 
     
-    def set_context(self, context):
-        self.context = context 
+#     def set_context(self, context):
+#         self.context = context 
     
-    def wrap_context(self, message):
-        if self.dry_run:
-            message = f'[ DRY RUN ] {message}'
-        if self.context:
-            message = f'[ {self.context} ] {message}'
-        return message 
+#     def wrap_context(self, message):
+#         if self.dry_run:
+#             message = f'[ DRY RUN ] {message}'
+#         if self.context:
+#             message = f'[ {self.context} ] {message}'
+#         return message 
     
-    def _wrap(self, call, message, color=None):
-        if not self.quiet:
-            message = self.wrap_context(message)
-            if color:
-                call(colorwrapper(message, color))
-            else:
-                call(message)
+#     def _wrap(self, call, message, color=None):
+#         if not self.quiet:
+#             message = self.wrap_context(message)
+#             if color:
+#                 call(colorwrapper(message, color))
+#             else:
+#                 call(message)
     
-    def text(self, message):
-        if not self.quiet:
-            self.logger.warning(message)
+#     def text(self, message):
+#         if not self.quiet:
+#             self.logger.warning(message)
             
-    def debug(self, message):
-        self._wrap(self.logger.debug, message, 'darkgray')
+#     def debug(self, message):
+#         self._wrap(self.logger.debug, message, 'darkgray')
     
-    def info(self, message):
-        self._wrap(self.logger.info, message, 'white')
+#     def info(self, message):
+#         self._wrap(self.logger.info, message, 'white')
     
-    def warning(self, message):
-        self._wrap(self.logger.warning, message, 'orange')
+#     def warning(self, message):
+#         self._wrap(self.logger.warning, message, 'orange')
 
-    def success(self, message):
-        self._wrap(self.logger.info, message, 'green')
+#     def success(self, message):
+#         self._wrap(self.logger.info, message, 'green')
     
-    def error(self, message):
-        self._wrap(self.logger.error, message, 'red')
+#     def error(self, message):
+#         self._wrap(self.logger.error, message, 'red')
 
-    def exception(self, data=False):
-        stack_summary = traceback.extract_tb(sys.exc_info()[2])
-        self.logger.error(stack_summary)
-        if logging._nameToLevel[self.log_level.upper()] <= logging.ERROR:
-            self.logger.error(sys.exc_info()[0])
-            self.logger.error(sys.exc_info()[1])
-            for line in stack_summary.format():
-                self.logger.error(line)
+#     def exception(self, data=False):
+#         stack_summary = traceback.extract_tb(sys.exc_info()[2])
+#         self.logger.error(stack_summary)
+#         if logging._nameToLevel[self.log_level.upper()] <= logging.ERROR:
+#             self.logger.error(sys.exc_info()[0])
+#             self.logger.error(sys.exc_info()[1])
+#             for line in stack_summary.format():
+#                 self.logger.error(line)
 
 UNITS = [
     {
@@ -145,6 +142,7 @@ def stob(val):
     return str(val).lower() in ['1', 'true', 'yes', 'y']
 
 def get_folder_free_space(folder):
+    '''Folder free space in kilobytes'''
     cp = subprocess.run("df -k %s | grep -v Used | awk '{ print $4 }'" % folder, shell=True, text=True, capture_output=True)
     return int(cp.stdout.replace('\n', ''))
 

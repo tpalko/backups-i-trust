@@ -78,7 +78,7 @@ resource "aws_s3_bucket" "archive_bucket" {
         sse_algorithm   = "AES256"
       }
     }
-  }
+  }  
   lifecycle_rule {
     enabled   = true 
     id        = "deep_archive_transition"

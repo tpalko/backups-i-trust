@@ -9,3 +9,6 @@ local
 .cache
 vendor
 working
+build
+*.egg-info
+*.db

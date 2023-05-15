@@ -1,8 +1,8 @@
+import cowpy 
 import boto3
 import os
 import math
 from enum import Enum 
-import logging
 import json 
 import base64
 from contextlib import contextmanager
@@ -11,6 +11,7 @@ from pytz import timezone
 from common import get_path_uncompressed_size_kb, human, frequency_to_minutes, time_since
 
 UTC = timezone('UTC')
+CACHE_FILE = f'/tmp/bckt.cache'
 
 REMOTE_STORAGE_COST_GB_PER_MONTH = 0.00099
 
@@ -36,9 +37,15 @@ class AwsClient:
         if 'db' not in kwargs or not kwargs['db']:
             raise Exception('db must be supplied to AwsClient')
         
+        self.logger = cowpy.getLogger()
+        
         self.bucket_name = kwargs['bucket_name']
         self.db = kwargs['db']
-        self.logger = kwargs['logger'] if 'logger' in kwargs else logging.getLogger(__name__)
+        
+        self.cache_file = CACHE_FILE
+        if 'cache_filename' in kwargs:
+            self.cache_file = kwargs['cache_filename'] 
+        
 
     @contextmanager
     def archivebucket(self, bucket_name):
@@ -145,18 +152,18 @@ class AwsClient:
     def cache(self, read_only=True):
         
         contents = {}
-        if not os.path.exists('.cache'):
-            with open('.cache', 'w') as f:
+        if not os.path.exists(self.cache_file):
+            with open(self.cache_file, 'w') as f:
                 # self.logger.debug(f'saving {contents}')
                 f.write(json.dumps(contents, indent=4))
                 
-        with open('.cache', 'r') as f:
+        with open(self.cache_file, 'r') as f:
             raw_contents = f.read()
             # self.logger.debug(raw_contents)
             contents = json.loads(raw_contents)
             yield contents 
         if not read_only:
-            with open('.cache', 'w') as f:
+            with open(self.cache_file, 'w') as f:
                 f.write(json.dumps(contents, indent=4))
 
     def _get_cache_id(self, cache_type, target_name=None):

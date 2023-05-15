@@ -1,6 +1,73 @@
 ##
 
-## development
+## deploy
+
+| make rule | result | use case |
+|---|---|---|
+| `make install` | `/usr/local/bin/bckt` | static install, normal use |
+| `make link-install` | `/usr/local/bin/bckt -> src/backup.py` | editable, use-in-development | 
+
+### Deployment Caveats
+
+* `frank-common` and `cowpy` are both required dependencies, although these projects aren't formally distributed. See the table below for installation instructions.
+
+### database 
+
+MariaDB [(none)]> create user if not exists bckt identified by 'bckt';
+MariaDB [(none)]> create database if not exists bckt;
+MariaDB [(none)]> grant all privileges on bckt.* to bckt;
+
+## running development notes
+
+5/5/23
+
+target list, need to see:
+* default sort is 'last archive timestamp'
+* don't show paused targets, but show count of paused targets, maybe shortname list in status block
+* see 'last result at' - timestamp of the last attempt
+* see 'last result' - whatever resulted from the last run: archive created, nothing new, not scheduled
+* see 'last reason' - the reason for whatever resulted from the last run
+* some visibility on include/exclude, we want to know if we're missing important stuff and if we're capturing too much 
+* what would happen per target if run now: would backup, would check, nothing <-- a check can be triggered manually and results cached, to allow "would backup"
+    * maybe this is "not scheduled", "scheduled", and "ready" (basicaly implying scheduled.. we wouldn't know to be in ready state if not scheduled)
+
+make clear the various flows: 
+    - not scheduled: last archive is within the target's defined backup period
+    - scheduled: due to check for new files 
+    - ready: as of the last check, there are new files
+    
+    - a target can be attempted at any time, but its frequency will limit whether it will even try to determine if there are new files
+    - if a target's frequency determines it should be checked, new files will be looked for
+
+tasks:
+    - fix sorting interface
+    - filter out paused targets, include names in status block
+    - add 'last_result_at' and 'last_result' columns, populate appropriately -- "result of last scheduled attempt" NOT "not scheduled"
+        - last result (enum): created archive, nothing new, failed
+        - last reason (text): generally the specific error if result is failed (should be "last error" ??)
+        - last result at: careful, different than 'last archive at', though will be the same if 'last result' is 'created archive'.. this is basically 'last time we attempted and the target was actually scheduled'
+    - codify ephemeral field 'status', shown in target list either color coded or displayed explicitly: not scheduled, scheduled, new files
+    - add # files/size of exclude, to complement 'last archive size'
+    - tweak target list to show necessary columns: 'last attempt' columns, 'exclude details' columns, 'status' column
+
+track time elapsed to backup an archive
+BUG: marker timestamps aren't getting set in the database, causing many unnecessary, enormous backups
+programmatic status output, oldest or newest error reason
+migrate to frank.database 
+better help.. show actual parameters for each command .. normal help stuff 
+cleaning up orphaned archives 
+install dependencies cowpy + frank-common
+
+4/20/23
+
+lock file to block concurrent runs from crontab 
+audit table, or "last reason"
+at least one remote archive regardless of budget, under a max threshold
+splitting option.. analyze a folder to determine how to break into multiple targets 
+choose between multiple storage classes, per target 
+estimate actual compressed size, not on-disk, for projection
+use excludes when calculating projected size 
+
 
 2/3/23
 
@@ -49,19 +116,19 @@ maybe.. even use compression history for the target path to estimate actual arch
 
 12/30/21
 
-targets list -literally anything- will parse to full=True 
-the function has a 'full' parameter, and we should be able to access this by name 
-or at least parse something like -f or -a into a boolean for this parameter - how to genericize?
+DC targets list -literally anything- will parse to full=True 
+DC the function has a 'full' parameter, and we should be able to access this by name 
+DC or at least parse something like -f or -a into a boolean for this parameter - how to genericize?
 
 11/17/21:
-* direct command line disk cleanup / remote prune
+* DONE direct command line disk cleanup / remote prune
 
 11/16/21: 
 
 Many of the items below (9/9/21) may be done.. 
 
-* report of filtered/non-backed-up files 
-* handling of orphaned files 
+* FLOATED report of filtered/non-backed-up files 
+* FLOATED handling of orphaned files 
     - these aren't addressed by runtime cleanup 
     - generally, how do local orphans happen? remote? is this a bug or old code?
 
@@ -70,13 +137,59 @@ done:
 
 9/9/21:
 
-* halt/interrupt handling
+* halt/interrupt handling - must Ctrl-C for each target 
 * main try/except block needs to manage output streams better, only prints traceback to tee -a target 
 * tee -a seems to not flush?
 * fix remote cleanup for sensible defaults (always leave at least one archive per target)
-* what? fix target listing local/remote counts to show how many local and remote and total
-* target listing to show relevant stats about archives, status, cost
-* fix command handling to be more maintainable, documented, standard 
-* what other reports, listings are useful?
+* DONE? what? fix target listing local/remote counts to show how many local and remote and total
+* DONE? target listing to show relevant stats about archives, status, cost
+* EHH fix command handling to be more maintainable, documented, standard 
+* GOOD Q what other reports, listings are useful?
 * DONE target enabled flag
 * DONE command-line support for tweaking and editing targets 
+
+# Appendix A: old stuff 
+
+ # def init_commands(self):
+    #     '''
+    #     bckt db init
+    #     bckt info 
+    #     bckt target add <path> [-n NAME] [-f FREQUENCY] [-b BUDGET] [-e EXCLUDES]
+    #     bckt target edit <TARGET NAME> [-f FREQUENCY] [-b BUDGET] [-e EXCLUDES]
+    #     bckt target pause|unpause <TARGET NAME>
+    #     bckt target list [TARGET NAME]
+    #     bckt run [TARGET NAME]
+    #     bckt target run <TARGET NAME>
+    #     bckt target push <TARGET NAME>
+    #     bckt archive list [TARGET NAME]
+    #     bckt archive prune 
+    #     bckt archive aggressive-prune 
+    #     bckt archive restore <ID>
+    #     globals:
+    #         set log level:  -l <LOG LEVEL>
+    #         set quiet:      -q
+    #         set verbose:    -v
+    #         set dry run:    -d
+    #         set no headers: --no-headers
+    #     '''
+        
+    #     return {
+    #         'db init': self.initialize_database,
+    #         'info': self.print_header,
+    #         'target add': self.create_target,
+    #         'target edit': self.edit_target,
+    #         'target info': self.target_info,
+    #         'target pause': self.pause_target,
+    #         'target unpause': self.unpause_target,
+    #         'target list': self.print_targets,
+    #         'run': self.run,
+    #         'target run': self.add_archive,
+    #         'target push': self.push_target_latest,
+    #         'archive list': self.print_archives,
+    #         'archive last': self.print_last_archive,
+    #         'archive prune': self.prune_archives,
+    #         'archive aggressive-prune': self.prune_archives_aggressively,
+    #         'archive restore': self.restore_archive,
+    #         'fixarchives': self.db.fix_archive_filenames,
+    #         'help': self.print_help
+    #     }

@@ -1,4 +1,4 @@
-import logging 
+import cowpy
 import subprocess
 from common import colorwrapper
 
@@ -31,7 +31,7 @@ class Columnizer(object):
             self.__setattr__(k, kwargs[k])
             
         if not self.logger:            
-            self.logger = logging.getLogger(__name__)
+            self.logger = cowpy.getLogger()
 
     def _pad_tabs(self, data):
 
@@ -84,7 +84,15 @@ class Columnizer(object):
         print_data = "\n\"; printf \"".join([ colorwrapper("\t".join([ str(v) for v in row ]), color if not (highlight_template and highlight_template[i]) else highlight_template[i].value) for i, row in enumerate(data) ])
         return "%s; printf \"%s\n\"; %s;" % (tabs_cmd, print_data, self.TAB_STD_INTERVAL)
         
-    def print(self, table, header, highlight_template=None, data=False):
+    def print(self, table, header, highlight_template=None, data=False, **kwargs):
+
+        '''
+        {'cell_padding': 5, 'header_color': 'white', 'row_color': 'orange'}
+        '''
+
+        # TODO: fix passing ^^^ this stuff
+        for k in kwargs:
+            self.__setattr__(k, kwargs[k])
 
         if not data and self.quiet:
             return 

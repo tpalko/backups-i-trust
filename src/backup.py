@@ -4,94 +4,30 @@ import cowpy
 from datetime import datetime
 from enum import Enum 
 import json
-import copy
 import os 
 import shutil
 import sys
 import traceback 
 import math
 # import hashlib
-import sqlite3
 import subprocess 
 import inspect 
-import logging
 import time 
-from common import smart_precision, get_folder_free_space, get_path_uncompressed_size_kb, human, stob, time_since, frequency_to_minutes, Frequency, FrankLogger, Color
+from common import smart_precision, get_folder_free_space, get_path_uncompressed_size_kb, human, stob, time_since, frequency_to_minutes, Frequency, Color
+from config import Config 
 from awsclient import AwsClient 
 from columnizer import Columnizer
-from database import Database 
+from bcktdb import BcktDb
 
 MARKER_PLACEHOLDER_TEXT = f'this is a backup timestamp marker. its existence is under the control of {os.path.realpath(__file__)}'
 
-EXCLUDE_VCS_IGNORES_DEFAULT = False 
-ORDER_BY_DEFAULT = 'name'
-
-# -- this is the default template to be updated by matching input below 
-# -- it will be passed as keyword args to logging and the main backup class 
-FLAGS = {
-    'quiet': False,
-    'headers': True,
-    'verbose': False,
-    'sort_targets': False,
-    'order_by': ORDER_BY_DEFAULT,
-    'dry_run': False,
-    'log_level': 'info',
-    'force_push_latest': False,
-    'exclude_vcs_ignores': EXCLUDE_VCS_IGNORES_DEFAULT
-}
-
-# -- input matching these will update flags with the corresponding dict
-FLAGS_OPTIONS = {
-    '-q': {'quiet': True},
-    '--no-headers': {'headers': False},
-    '-v': {'verbose': True},
-    '-s': {'sort_targets': True},
-    '-d': {'dry_run': True},
-    '-f': {'force_push_latest': True}
-}
-
-# -- input matching these will become keyword args passed to the command
-# -- flags will steal (take precedence) for matching keywords
-NAMED_PARAMETER_OPTIONS = {
-    '--name': 'name',
-    '--freq': 'frequency',
-    '--budget': 'budget',
-    '-l': 'log_level',
-    '-o': 'order_by',
-    '--excludes': 'excludes'
-}
-
-BACKUP_HOME = f'{os.path.dirname(os.path.realpath(__file__))}'
-
-S3_BUCKET = None 
-DATABASE_FILE = os.path.join(BACKUP_HOME, 'backups.db')
-WORKING_FOLDER = os.path.join(BACKUP_HOME, 'working')
-NO_SOLICIT = False 
-EXCLUDE_VCS_IGNORES = EXCLUDE_VCS_IGNORES_DEFAULT
-
-# -- config from file overwrites defaults 
-RCFILE = os.getenv('FRANKBACK_RC_FILE') or os.path.join(os.path.expanduser(f'~{os.getenv("USER")}'), '.frankbackrc')
-
-if RCFILE and os.path.exists(RCFILE) and os.path.isfile(RCFILE):
-    from configparser import ConfigParser 
-    p = ConfigParser()
-    p.read(RCFILE)
-    if p.has_section('default'):
-        S3_BUCKET = p['default']['s3_bucket'] if 's3_bucket' in p['default'] else None 
-        DATABASE_FILE = p['default']['database_file'] if 'database_file' in p['default'] else DATABASE_FILE
-        WORKING_FOLDER = p['default']['working_folder'] if 'working_folder' in p['default'] else WORKING_FOLDER
-        NO_SOLICIT = stob(p['default']['no_solicit']) if 'no_solicit' in p['default'] else NO_SOLICIT
-        EXCLUDE_VCS_IGNORES = stob(p['default']['exclude_vcs_ignores']) if 'exclude_vcs_ignoers' in p['default'] else EXCLUDE_VCS_IGNORES_DEFAULT
-else:
-    RCFILE = None 
-
-# -- env overwrites anything set so far 
-S3_BUCKET = os.getenv('S3_BUCKET', S3_BUCKET)
-DATABASE_FILE = os.getenv('DATABASE_FILE', DATABASE_FILE)
-WORKING_FOLDER = os.getenv('WORKING_FOLDER', WORKING_FOLDER)
-NO_SOLICIT = stob(os.getenv('FRANKBACK_NO_SOLICIT', NO_SOLICIT))
-EXCLUDE_VCS_IGNORES = stob(os.getenv('EXCLUDE_VCS_IGNORES', EXCLUDE_VCS_IGNORES))
-DRY_RUN = stob(os.getenv('DRY_RUN', False))
+class Reason(Enum):
+    DISK_FULL = 'disk_full'
+    BUDGET = 'budget'
+    NOTHING_NEW = 'nothing_new'
+    NOT_ACTIVE = 'not_active'
+    NOT_SCHEDULED = 'not_scheduled'
+    OK = 'ok'
 
 class Location(Enum):
     LOCAL_AND_REMOTE = 'local_and_remote'
@@ -99,8 +35,6 @@ class Location(Enum):
     REMOTE_ONLY = 'remote_only'
     DOES_NOT_EXIST = 'does_not_exist'
     LOCAL_REMOTE_UNKNOWN = 'local_remote_unknown'
-
-# LOG_FILE = '/var/log/frankback/frankback.log'
 
 #######################
 #
@@ -120,7 +54,7 @@ class Results(object):
             'other_failure': 0
         }
     
-    def log(self, reason):
+    def log(self, target_name, reason):
         if reason not in self._results:
             self._results[reason] = 0
         self._results[reason] += 1
@@ -129,153 +63,241 @@ class Results(object):
         print('\n\nResults:')
         print(json.dumps(self._results, indent=4))
 
-if not os.path.exists("/var/log/bckt"):
-    os.makedirs(os.path.join(os.path.sep, 'var', 'log', 'bckt'))
-
-logger = cowpy.getLogger()
-user_logger = cowpy.getLogger('user')
-
 class Backup(object):
     
     logger = None 
     user_logger = None
-
+    
     db = None 
     awsclient = None 
+    columnizer = None 
 
-    dry_run = None 
     verbose = False 
-    sort_targets = False 
-    
-    current_target = None 
+    sort_targets = False     
+
+    command = None 
+    command_context = None 
 
     def __init__(self, *args, **kwargs):
         
-        self.logger = kwargs['logger'] if 'logger' in kwargs else cowpy.getLogger()
-        self.user_logger = kwargs['user_logger'] if 'logger' in kwargs else cowpy.getLogger('user')
-
-        if 'bucket_name' not in kwargs or kwargs['bucket_name'] == '':
-            raise Exception("bucket_name must be supplied to Backup")
-
-        self.db = Database(logger=self.logger, db_file=DATABASE_FILE)
-        self.awsclient = AwsClient(bucket_name=kwargs['bucket_name'], db=self.db, logger=self.logger)
-
         for k in kwargs:
-            setattr(self, k, kwargs[k])
+            setattr(self, k, kwargs[k])        
+
+        if not isinstance(self.config, Config):
+            raise Exception(f'Please use {Config.__qualname__} as config')
         
-        if DRY_RUN:
-            self.dry_run = DRY_RUN
+        if not self.config.s3_bucket:
+            raise Exception("bucket_name must be supplied to Backup")
         
-    def init_commands(self):
-        '''
-        bckt db init
-        bckt info 
-        bckt target add <path> [-n NAME] [-f FREQUENCY] [-b BUDGET] [-e EXCLUDES]
-        bckt target edit <TARGET NAME> [-f FREQUENCY] [-b BUDGET] [-e EXCLUDES]
-        bckt target pause|unpause <TARGET NAME>
-        bckt target list [TARGET NAME]
-        bckt run [TARGET NAME]
-        bckt target run <TARGET NAME>
-        bckt target push <TARGET NAME>
-        bckt archive list [TARGET NAME]
-        bckt archive prune 
-        bckt archive aggressive-prune 
-        bckt archive restore <ID>
-        globals:
-            set log level:  -l <LOG LEVEL>
-            set quiet:      -q
-            set verbose:    -v
-            set dry run:    -d
-            set no headers: --no-headers
-        '''
-        return {
-            'db init': self.initialize_database,
+        self._set_log_level(log_level='debug')
+
+        self.solicit()
+
+        self.db = BcktDb(config=self.config)
+        self.awsclient = AwsClient(bucket_name=self.config.s3_bucket, db=self.db, cache_filename=self.config.cache_filename)
+        self.columnizer = Columnizer(**kwargs)
+        
+        self.command = []
+        self.command_context = self.command_index() 
+    
+    def _set_log_level(self, log_level='warning'):                
+        self.logger = cowpy.getLogger()
+        self.user_logger = cowpy.getLogger(name='user')
+
+    def solicit(self):
+        if self.config.is_no_solicit:
+            return 
+        import random 
+        sol_chance_low = 1
+        sol_chance_high = 5
+        sol_chance_val = random.randint(sol_chance_low, sol_chance_high)
+        if sol_chance_val == 1:        
+            self.logger.error(f'WOW! This is annoying!')
+            time.sleep(.5)
+            self.logger.error('but if you are enjoying this backup solution')
+            time.sleep(.5)
+            self.logger.error('and you find it reduces your anxiety')
+            time.sleep(.5)
+            self.logger.error('all while being ridiculously easy to use')
+            time.sleep(.5)
+            self.logger.info('please consider throwing me a few bucks on PayPal @ timpalko79@yahoo.com')
+            time.sleep(.5)
+            self.logger.info('that\'s.. timpalko79@yahoo.com!')
+            time.sleep(2)
+            self.logger.warning('(You can turn this off')
+            self.logger.warning('by adding no_solicit = true in your FRANKBACK_RC_FILE')
+            self.logger.warning('or by setting env FRANKBACK_NO_SOLICIT=1)')
+            
+    def command_index(self):
+
+        contexts = {
+            'db': {
+                '_help': 'Database activities',
+                'init': self.initialize_database,
+                'writeout': self.db.writeout
+            },
             'info': self.print_header,
-            'target add': self.create_target,
-            'target edit': self.edit_target,
-            'target pause': self.pause_target,
-            'target unpause': self.unpause_target,
-            'target list': self.print_targets,
+            'target': {
+                '_help': 'Target activities',
+                'add': self.create_target,
+                'edit': self.edit_target,
+                'info': self.target_info,
+                'pause': self.pause_target,
+                'unpause': self.unpause_target,
+                'list': self.print_targets,
+                'run': self.add_archive,
+                'push': self.push_target_latest
+            },
             'run': self.run,
-            'target run': self.add_archive,
-            'target push': self.push_target_latest,
-            'archive list': self.print_archives,
-            'archive last': self.print_last_archive,
-            'archive prune': self.prune_archives,
-            'archive aggressive-prune': self.prune_archives_aggressively,
-            'archive restore': self.restore_archive,
-            'fixarchives': self.db.fix_archive_filenames,
+            'archive': {
+                '_help': 'Archive activities',
+                'list': self.print_archives,
+                'last': self.print_last_archive,
+                'prune': self.prune_archives,
+                'aggressive': self.prune_archives_aggressively,
+                'restore': self.restore_archive,
+                'fixarchives': self.db.fix_archive_filenames
+            },            
             'help': self.print_help
         }
+
+        return contexts
 
     def print_help(self):
         '''
         Print this help
-        '''
+        '''        
 
-        for command in self.init_commands().keys():
-            fn = self.init_commands()[command]
-            sig = (' '.join(inspect.signature(fn).parameters.keys())).upper()
-            # fn_name = fn.__code__.co_name 
-            doc = fn.__doc__
-            if doc:
-                while doc.find('DOCDEFER') == 0:
-                    doc_location = doc.split(':')[1]
-                    doc = eval(doc_location).__doc__
-            print(f'{command} {sig}')
-            print(f'\t{doc}\n' if doc else '')
-    
-    def command(self, positional_parameters, named_parameters):
+        if type(self.command_context) == dict:
+
+            self.logger.debug(f'printing help: {self.command_context}')
+
+            function_parameters = []
+            context_parameters = []
+
+            for parameter in self.command_context.keys():
+                parameter_context = self.command_context[parameter]
+                sig = ''
+                doc = None 
+                help = None 
+
+                if parameter_context.__class__.__name__ == "method":
+                    sig = (' '.join(inspect.signature(parameter_context).parameters.keys())).upper()
+                    # parameter_context_name = parameter_context.__code__.co_name 
+                    doc = parameter_context.__doc__
+                    if doc:
+                        # -- something like 
+                        # q'''DOCDEFER:Database.init_db'''
+                        while doc.find('DOCDEFER') == 0:
+                            doc_location = doc.split(':')[1]
+                            doc = eval(doc_location).__doc__
+                    
+                    function_parameters.append(f'\t{parameter} {sig}\n\t\t{doc or ""}\n')
+                    
+                elif '_help' in parameter_context:
+                    help = f' --> {parameter_context["_help"]}'
+                    context_parameters.append(f'\t{parameter}\t\t{help or ""}')
+            
+            if self.command:
+                self.user_logger.info(f'Command: {" ".join(self.command)}')
+
+            for f in function_parameters:
+                self.user_logger.info(f)
+            for f in context_parameters:
+                self.user_logger.info(f)
+
+    def parse_command(self, positional_parameters, named_parameters):
+
+        self.logger.debug(f'parsing command -- positional: {positional_parameters}, named: {named_parameters}')
 
         if len(sys.argv) < 2:
             self.print_help()
             exit(1)
 
-        # -- starting from the first post-executable token and progressively 
-        # -- including subsequent tokens 
-        # -- find the first full command match in provided 'commands' keys 
-        # -- note that this implies more complex commands must come earlier 
-        # -- i.e. "run program" would match "run" if tested, even if it was meant 
-        # -- to match "run program", so "run program" must come before "run" in 'commands'
+        position = 0
+        self.command = []
 
-        # -- increment until we match a command 
-        tokens = 1
-        command = ""
-        while True:
-            if tokens > len(positional_parameters):
-                self.user_logger.error(f'The command {command} is not supported.')
-                exit(1)    
-            command = " ".join(positional_parameters[0:tokens])
-            if command in self.init_commands().keys():
+        # consume all positional parameters          
+        # until a command termination or invalid parameter is found
+        while position < len(positional_parameters):
+        
+            parameter = positional_parameters[position]            
+            
+            self.logger.debug(f'parsing positional parameter {parameter}')
+            if type(self.command_context) != dict:
                 break 
-            tokens += 1
-        
-        fn = self.init_commands()[command]
 
-        # -- any arguments left over after matching the command are compiled here 
-        args = positional_parameters[tokens:] if len(positional_parameters) > tokens else []
-        
-        self.print_header()
+            if parameter not in self.command_context:
+                break 
+            
+            # -- incrementing here (instead of earlier or later) ensures we're consistently
+            # -- at the end of valid input after the loop 
+            position += 1
 
-        try:
-            fn(*args, **named_parameters)
-        except:
-            # self.logger.error(f'Please refer to help for "{command}"')
-            # self.logger.error('Some common errors:')
-            # self.logger.error('- unquoted strings with spaces')
-            self.logger.exception()
+            self.command_context = self.command_context[parameter]
+            self.command.append(parameter)
+
+            # if self.command_context.__class__.__name__ == 'function':
+            #     break 
         
+        if type(self.command_context) == dict:
+            self.print_help()
+        else:
+            self.logger.debug(f'found a fn: {self.command_context.__name__}')
+            # -- any arguments left over after matching the command are compiled here 
+            args = positional_parameters[position:] if len(positional_parameters) > position else []
+            
+            # -- the 'info' command already (and only) prints the header
+            if self.command_context != self.print_header:
+                self.print_header()
+#                 self.user_logger.info(f'\n\
+# *********begin output***********\n')
+                                      
+            try:
+                command_parameters = inspect.signature(self.command_context).parameters.keys()
+                passed_parameters = { p: named_parameters[p] for p in named_parameters.keys() if p in command_parameters }
+                global_parameters = { p: named_parameters[p] for p in named_parameters.keys() if p not in command_parameters }
+                
+                self.logger.debug(f'args: {args}, all named_parameters: {named_parameters}, passed: {passed_parameters}')
+
+                for p in global_parameters.keys():
+                    self.logger.debug(f'command setting instance parameter: {p} -> {global_parameters[p]}')
+                    if p == "log_level":
+                        self._set_log_level(global_parameters[p])
+                    else:
+                        self.__setattr__(p, global_parameters[p])
+
+                self.logger.debug(f'calling {self.command_context} with {args} and {passed_parameters}')
+
+                self.command_context(*args, **passed_parameters)
+            # except BcktDatabaseException as bde:
+            #     self.user_logger.error(str(bde))
+            except:
+                # self.logger.error(f'Please refer to help for "{command}"')
+                # self.logger.error('Some common errors:')
+                # self.logger.error('- unquoted strings with spaces')
+                # self.logger.exception()
+                self.user_logger.exception()
+                self.user_logger.warning("That won't work!")
+                self.print_help()
+    
     def print_header(self):
-        self.logger.info(f'\n\n\
+        '''
+        Print information regarding the current environment
+        '''
+        self.user_logger.info(f'\n\n\
 Date:\t\t{datetime.now()}\n\
 User:\t\t{os.getenv("USER", "unknown")}\n\
-Database file:\t{DATABASE_FILE}\n\
-RC File:\t{RCFILE}\n\
 Command:\t{" ".join(sys.argv)}\n\
-Working folder:\t{WORKING_FOLDER}\n\
-\n\
-*********begin output***********\n')
+Working folder:\t{self.config.working_folder}\n\
+Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f} GB\n\
+')
     
+    def confirm(self, msg):
+        self.user_logger.info(msg)
+        user_response = input(f'? y/N ')
+        return user_response == 'y'
+
     def targets(self, target_name=None):
          targets = []
 
@@ -284,7 +306,7 @@ Working folder:\t{WORKING_FOLDER}\n\
              if target:
                  targets.append(target)
          else:
-             targets = self.db.get_targets()            
+             targets = self.db.get_targets()
          
          self.logger.debug(f'fetching remote stats on {len(targets)} targets')
          remote_stats = self.awsclient.get_remote_stats(targets)
@@ -299,21 +321,39 @@ Working folder:\t{WORKING_FOLDER}\n\
         '''DOCDEFER:Database.init_db'''
         self.db.init_db()
 
-    def create_target(self, path, name=None, frequency=Frequency.DAILY.value, budget=0.01, excludes=''):
+    def create_target(self, path, target_name=None, frequency=Frequency.DAILY.value, budget=0.01, excludes=''):
+        
+        if not target_name:
+            target_name = path
 
-        if not name:
-            name = path.replace('/', '-').lstrip('-').rstrip('-')
+        target_name = target_name.replace('/', '-').lstrip('-').rstrip('-')
 
-        self.db.create_target(path, name, frequency, budget=budget, excludes=excludes)
+        if self.confirm(f'Create a new target "{target_name}" at {path}?'):
+            self.db.create_target(path, target_name, frequency, budget=budget, excludes=excludes)
 
-    def edit_target(self, target_name, frequency=None, budget=None, excludes=None):
+    def target_info(self, target_name):
+        target = self.db.get_target(name=target_name)
+        remote_stats = self.awsclient.get_remote_stats([target])
+        for k in target.keys():
+            val = target[k]
+            if k == "excludes":
+                if self.verbose:
+                    val = val.split(':')
+            self.user_logger.info(f'{k}: {val}')
+        self.user_logger.info(json.dumps(remote_stats, indent=4))
+
+    def edit_target(self, target_name, frequency=None, budget=None, path=None, excludes=None):
         '''Sets target parameters'''
+
         if frequency is not None:
             frequency_choices = [ m.lower() for m in Frequency.__members__ ]
             if frequency not in frequency_choices:
                 raise Exception(f'"{frequency}" is not a valid frequency (choose: {",".join(frequency_choices)})')
 
-        self.db.update_target(target_name, frequency=frequency, budget_max=budget, excludes=excludes)
+        # excludes = ":".join([ kwargs[k] for k in kwargs if k == "excludes" and kwargs[k][0] == "+" ]) or None 
+                
+        self.db.update_target(target_name, frequency=frequency, budget_max=budget, excludes=excludes, path=path)
+        self.target_info(target_name)
 
     def pause_target(self, target_name):
         '''Sets target inactive'''
@@ -360,8 +400,9 @@ Working folder:\t{WORKING_FOLDER}\n\
 
             if not pre_marker_date:
                 pre_marker_file = self.get_marker_path(target, 'pre')
-                pre_marker_stat = shutil.os.stat(pre_marker_file)            
-                pre_marker_date = datetime.fromtimestamp(pre_marker_stat.st_mtime)
+                if os.path.exists(pre_marker_file):
+                    pre_marker_stat = shutil.os.stat(pre_marker_file)            
+                    pre_marker_date = datetime.fromtimestamp(pre_marker_stat.st_mtime)
 
                 if pre_marker_date and not target["pre_marker_at"]:
                     self.db.update_target(target["name"], pre_marker_at=pre_marker_date)
@@ -381,6 +422,7 @@ Working folder:\t{WORKING_FOLDER}\n\
 
                     since_pre_minutes = (datetime.utcnow() - pre_marker_date).total_seconds() / 60.0    
                     find_cmd = f'find {target["path"]} -mmin -{since_pre_minutes}'
+                    self.logger.info(find_cmd)
                     cp = subprocess.run(find_cmd.split(' '), check=True, capture_output=True)
 
                     # cp = subprocess.run(f'find {target["path"]} -newer {pre_marker}'.split(' '), check=True, capture_output=True)
@@ -465,9 +507,9 @@ Working folder:\t{WORKING_FOLDER}\n\
                             self.logger.warning(f'[ DRY RUN ] {message}')
                         else:
                             self.logger.warning(message)
-                            os.unlink(os.path.join(WORKING_FOLDER, archive["filename"]))            
+                            os.unlink(os.path.join(self.config.working_folder, archive["filename"]))            
 
-                if not cleaned_up_aggressively and os.path.exists(os.path.join(WORKING_FOLDER, archive["filename"])):                
+                if not cleaned_up_aggressively and os.path.exists(os.path.join(self.config.working_folder, archive["filename"])):                
                     if found < minimum_to_keep:
                         message = f'Keeping newer file {archive["filename"]}'
                         if dry_run:
@@ -477,19 +519,19 @@ Working folder:\t{WORKING_FOLDER}\n\
                         found += 1
                     else:
                         cleaned_up_by_target[t['name']] += archive['size_kb']
-                        message = f'Deleting file {os.path.join(WORKING_FOLDER, archive["filename"])}'
+                        message = f'Deleting file {os.path.join(self.config.working_folder, archive["filename"])}'
                         if dry_run:
                             self.logger.error(f'[ DRY RUN ] {message}')
                         else:
                             self.logger.error(message)
-                            os.unlink(os.path.join(WORKING_FOLDER, archive["filename"]))
+                            os.unlink(os.path.join(self.config.working_folder, archive["filename"]))
         
         return cleaned_up_by_target[target['name']] if target else cleaned_up_by_target
     
     def _create_working_folder(self):
-        if not os.path.isdir(WORKING_FOLDER):
-            os.makedirs(WORKING_FOLDER)
-            self.logger.success(f'Created working folder: {WORKING_FOLDER}')
+        if not os.path.isdir(self.config.working_folder):
+            os.makedirs(self.config.working_folder)
+            self.logger.success(f'Created working folder: {self.config.working_folder}')
             
     def add_archive(self, target_name, results=None):
         '''
@@ -504,21 +546,23 @@ Working folder:\t{WORKING_FOLDER}\n\
             results = Results()
 
         if not self.target_has_new_files(target):
-            self.logger.warning(f'No new files. Skipping archive creation.')
-            results.log('no_new_files')
+            self.logger.warning(f'No new files for {target_name}. Skipping archive creation.')
+            results.log(target_name, 'no_new_files')
+            self.db.set_target_last_reason(target_name, Reason.NOTHING_NEW)
             return
             
         target_size = get_path_uncompressed_size_kb(target['path'], target['excludes'])        
         last_archive = self.db.get_last_archive(target['id'])
         
-        increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
-        if increase > 0:
-            self.logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
-            # -- TODO: can put a limiter in here 
+        if last_archive:
+            increase = float("%.f" % (target_size*100.0 / int(last_archive['size_kb'])))
+            if increase > 0:
+                self.logger.warning(f'This target increased in size by {increase}% since the last archive ({smart_precision(target_size/(1024*1024))} GB over {smart_precision(int(last_archive["size_kb"])/(1024*1024))} GB)')
+                # -- TODO: can put a limiter in here 
         
         self._create_working_folder()
         
-        free_space = get_folder_free_space(WORKING_FOLDER)
+        free_space = get_folder_free_space(self.config.working_folder)
 
         if target_size > free_space:
             
@@ -538,7 +582,8 @@ Working folder:\t{WORKING_FOLDER}\n\
                 
                 if space_sum < additional_space_needed:
                     self.logger.error(f'Even after aggressively cleaning up local archives, an additional {human(additional_space_needed - space_sum, "kb")} is still needed. Please free up space and reschedule this target as soon as possible.')
-                    results.log('insufficient_space')
+                    results.log(target_name, 'insufficient_space')
+                    self.db.set_target_last_reason(target_name, Reason.DISK_FULL)
                     return 
                 else:
                     self.logger.warning(f'Cleaning up old local archives aggressively will free {human(space_sum, "kb")}. Proceeding with cleanup.')
@@ -552,7 +597,7 @@ Working folder:\t{WORKING_FOLDER}\n\
 
         try:
                 
-            target_file = f'{WORKING_FOLDER}/{target["name"]}_{datetime.strftime(datetime.now(), "%Y%m%d_%H%M%S")}.tar.gz'
+            target_file = f'{self.config.working_folder}/{target["name"].replace("/", "_")}_{datetime.strftime(datetime.now(), "%Y%m%d_%H%M%S")}.tar.gz'
             self.logger.info(f'Creating archive for {target["name"]}: {target_file}')
 
             excludes = ""
@@ -587,7 +632,8 @@ Working folder:\t{WORKING_FOLDER}\n\
             cp.check_returncode()
 
             if archive_errors.find("No space left on device") >= 0:
-                results.log('insufficient_space')
+                results.log(target_name, 'insufficient_space')
+                self.db.set_target_last_reason(target_name, Reason.DISK_FULL)
                 raise Exception("Insufficient space while archiving. Archive target file (assumed partial) will be deleted. Please clean up the disk and reschedule this target as soon as possible.")
             
             target_file_stat = shutil.os.stat(target_file)
@@ -601,7 +647,8 @@ Working folder:\t{WORKING_FOLDER}\n\
                 pre_marker_timestamp=pre_timestamp)
             
             self.update_markers(target, pre_timestamp)
-            results.log('archive_created')
+            results.log(target_name, 'archive_created')
+            self.db.set_target_last_reason(target_name, Reason.OK)
             
             self.logger.success(f'Archive record {new_archive_id} created for {target_file}')
             
@@ -649,7 +696,7 @@ Working folder:\t{WORKING_FOLDER}\n\
                 if self.force_push_latest or self.awsclient.is_push_due(target, remote_stats=remote_stats):
                     try:
                         if target['is_active']:
-                            archive_full_path = os.path.join(WORKING_FOLDER, last_archive["filename"])
+                            archive_full_path = os.path.join(self.config.working_folder, last_archive["filename"])
                             self.logger.success(f'Pushing {archive_full_path} ({human(last_archive["size_kb"], "kb")})')
                             if not self.dry_run:
                                 self.awsclient.push_archive(last_archive["name"], last_archive["filename"], archive_full_path)
@@ -668,7 +715,7 @@ Working folder:\t{WORKING_FOLDER}\n\
                 self.logger.info(f'The last archive is already pushed remotely')
     
     def restore_archive(self, archive_id):
-        '''Unpacks the archive identified by the ID provided into WORKING_FOLDER/restore/<target name>/<archive filename base>'''
+        '''Unpacks the archive identified by the ID provided into self.config.working_folder/restore/<target name>/<archive filename base>'''
         
         archive_record = self.db.get_archive(archive_id)
         if not archive_record:
@@ -679,8 +726,8 @@ Working folder:\t{WORKING_FOLDER}\n\
         if location in [Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY, Location.LOCAL_REMOTE_UNKNOWN]:
             self.logger.info(f'Archive {archive_record["filename"]} is local, proceeding to unarchive.')
             filenamebase = archive_record["filename"].split('.')[0]
-            archive_path = f'{WORKING_FOLDER}/{archive_record["filename"]}'
-            unarchive_folder = f'{WORKING_FOLDER}/restore/{archive_record["name"]}/{filenamebase}'
+            archive_path = f'{self.config.working_folder}/{archive_record["filename"]}'
+            unarchive_folder = f'{self.config.working_folder}/restore/{archive_record["name"]}/{filenamebase}'
             self.logger.info(f'Unarchiving into {unarchive_folder}')
             os.makedirs(unarchive_folder)
             unarchive_command = f'tar -xzf {archive_path} -C {unarchive_folder}'
@@ -693,6 +740,7 @@ Working folder:\t{WORKING_FOLDER}\n\
     ### other operations 
 
     def get_archives(self, target_name=None):
+        self.logger.debug(f'getting archives for {target_name}')
         db_records = self.db.get_archives(target_name)        
         s3_objects = self.awsclient.get_remote_archives(target_name)
         self.logger.debug(f'Have {len(db_records)} database records and {len(list(s3_objects))} S3 objects')
@@ -777,7 +825,7 @@ Working folder:\t{WORKING_FOLDER}\n\
             
             target_print_item['has_new_files'] = '-'
 
-            if self.verbose and target_print_item['is_active']:
+            if self.show_has_new_files and target_print_item['is_active']:
                 target_print_item['has_new_files'] = self.target_has_new_files(target_print_item, log=True)
 
             target_archives_by_created_at = { a['created_at']: a for a in archives if a['target_id'] == target_print_item['id'] }
@@ -792,7 +840,7 @@ Working folder:\t{WORKING_FOLDER}\n\
             # -- if no archives, we set some defaults and skip the remaining analysis 
             if len(target_archives_by_created_at) == 0:
                 target_print_item['last_archive_pushed'] = 'n/a'
-                if self.verbose and target_print_item['is_active']:
+                if self.show_would_push and target_print_item['is_active']:
                     target_print_item['would_push'] = target_print_item['has_new_files']
             else:
                 last_archive_created_at = max(target_archives_by_created_at.keys())
@@ -812,9 +860,10 @@ Working folder:\t{WORKING_FOLDER}\n\
                 total_last_archive_size_kb += last_archive['size_kb']
             
             
-            if self.verbose and target_print_item['is_active']:
+            if self.show_would_push and target_print_item['is_active']:
                 push_due = self.awsclient.is_push_due(target_print_item, remote_stats=remote_stats, print=False)
                 target_print_item['would_push'] = push_due and (not target_print_item['last_archive_pushed'] or target_print_item['has_new_files'])
+            if self.show_size_on_disk and target_print_item['is_active']:
                 target_print_item['uncompressed_kb'] = get_path_uncompressed_size_kb(target_print_item['path'], target_print_item['excludes'])
 
             target_print_item['local_archive_count'] = len(archives_by_target_and_location[target_print_item['id']]['local'])
@@ -827,6 +876,8 @@ Working folder:\t{WORKING_FOLDER}\n\
                 
         # self.logger.debug(json.dumps(target_print_items, indent=4))
         
+        # -- 'full' combines with 'verbose' and is only shown when verbose=True
+        # -- columns trimmed to header width by default, unless verbose=True or trunc=False 
         target_columns = [
             {
                 'key': 'name',
@@ -898,8 +949,9 @@ Working folder:\t{WORKING_FOLDER}\n\
         sorted_target_print_items = sorted(target_print_items, key=lambda t: t['path'])
 
         if self.sort_targets:
-            if self.verbose:
+            if self.show_would_push:
                 sorted_target_print_items = sorted(target_print_items, key=lambda t: not stob(t['would_push']))
+            if self.show_has_new_files:
                 sorted_target_print_items = sorted(sorted_target_print_items, key=lambda t: not stob(t['has_new_files']))
             sorted_target_print_items = sorted(sorted_target_print_items, key=lambda t: not stob(t['is_active']))
             # sorted_target_print_items.extend([ t for t in target_print_items if t['would_push'] == True ])
@@ -922,13 +974,13 @@ Working folder:\t{WORKING_FOLDER}\n\
         # -- unless the column specifies trunc: False 
         table = [ [ f'{str(t[c["key"]])[0:len(header[i])-2]}..' if len(str(t[c['key']])) > len(header[i]) and not self.verbose and ('trunc' not in c or c['trunc']) else t[c['key']] for i,c in enumerate(trimmed_target_columns) ] for t in sorted_target_print_items ]
 
-        c = Columnizer(logger=self.logger, **flag_args)
-        c.print(table, header, highlight_template=highlight_template, data=True)
+        # c = Columnizer(**flag_args)
+        self.columnizer.print(table, header, highlight_template=highlight_template, data=True)
         print(f'Total current backup size: {(total_last_archive_size_kb/(1024*1024)):.2f} GB')
 
     def get_archive_location(self, archive, remote_file_map=None):
         basename = os.path.basename(archive["filename"])
-        local_file_exists = os.path.exists(os.path.join(WORKING_FOLDER, archive["filename"]))
+        local_file_exists = os.path.exists(os.path.join(self.config.working_folder, archive["filename"]))
         remote_file_exists = remote_file_map and basename in remote_file_map
         location = Location.DOES_NOT_EXIST
 
@@ -1035,7 +1087,7 @@ Working folder:\t{WORKING_FOLDER}\n\
         rows = [ dict(zip(header, row)) for row in table ]
         for row in rows:
             if row['location'] != Location.DOES_NOT_EXIST:
-                logger.text(row['filename'])
+                self.user_logger.text(row['filename'])
                 break 
 
     def print_archives(self, target_name=None):
@@ -1043,8 +1095,10 @@ Working folder:\t{WORKING_FOLDER}\n\
 
         table, header = self._get_archives_for_target(target_name)
 
-        c = Columnizer(logger=self.logger, cell_padding=5, header_color='white', row_color='orange', **flag_args)
-        c.print(table, header, data=True)
+        # c = Columnizer(cell_padding=5, header_color='white', row_color='orange', **flag_args)
+        
+        # TODO.. this trashes the default config from __init__
+        self.columnizer.print(table, header, data=True, **{'cell_padding': 5, 'header_color': 'white', 'row_color': 'orange'})
 
     def prune_archives(self, target_name=None):
 
@@ -1076,7 +1130,7 @@ Working folder:\t{WORKING_FOLDER}\n\
 
         start = datetime.now()
 
-        self.logger.info(f'\nBackup run: {datetime.strftime(start, "%c")}')
+        self.user_logger.info(f'\nBackup run: {datetime.strftime(start, "%c")}')
 
         results = Results()
 
@@ -1085,14 +1139,19 @@ Working folder:\t{WORKING_FOLDER}\n\
             try:
                 
                 is_scheduled = self.target_is_scheduled(target)
-                if target['is_active'] and is_scheduled:                    
+                if target['is_active'] and is_scheduled:
+                    self.user_logger.info("Target is active and scheduled, proceeding to create an archive")
                     self.add_archive(target["name"], results)
                 else:
                     self.logger.warning(f'Not running {target["name"]} (scheduled={is_scheduled}, active={target["is_active"]})')
                     if not target["is_active"]:
-                        results.log('not_active')
-                    if not is_scheduled:
-                        results.log('not_scheduled')
+                        results.log(target["name"], 'not_active')
+                        self.user_logger.warning("Target is not active")
+                        self.db.set_target_last_reason(target["name"], Reason.NOT_ACTIVE)
+                    elif not is_scheduled:
+                        results.log(target["name"], 'not_scheduled')
+                        self.user_logger.warning(f'Target {target["name"]} is active but not scheduled')
+                        self.db.set_target_last_reason(target["name"], Reason.NOT_SCHEDULED)
             except:
                 self.logger.exception()
 
@@ -1123,75 +1182,23 @@ Working folder:\t{WORKING_FOLDER}\n\
 
         results.print()
 
-        self.logger.info(f'\n\nBackup run completed: {datetime.strftime(end, "%c")}\n')
+        self.user_logger.info(f'\n\nBackup run completed: {datetime.strftime(end, "%c")}\n')
 
-def parse_flags():
-    ''' Separate sys.argv into flags updates, actually make those updates and return everything else '''
+def main():
 
-    named_parameters = {}
-    positional_parameters = []
-    skip_next = False 
-    flag_args = {**FLAGS}
-    
-    for i, arg in enumerate(sys.argv[1:], 1):
-        
-        if skip_next:
-            skip_next = False 
-            continue 
+    config = Config()
 
-        if arg in FLAGS_OPTIONS:
-            flag_args.update(FLAGS_OPTIONS[arg])
-        elif arg in NAMED_PARAMETER_OPTIONS:
-            named_parameter_name = NAMED_PARAMETER_OPTIONS[arg]
-            new_parameter = {named_parameter_name: sys.argv[i+1]}
-            skip_next = True
-            # -- a named parameter will first try to set FLAGS with whatever is passed 
-            if named_parameter_name in flag_args.keys():
-                flag_args.update(new_parameter)
-            else:
-                # -- but if no flag matches, we get a named parameter
-                named_parameters.update(new_parameter)            
-        else:
-            positional_parameters.append(arg)
-    
-    return flag_args, positional_parameters, named_parameters
+    if not os.path.exists(config.log_folder):
+        os.makedirs(config.log_folder)
 
-def solicit():
-    if NO_SOLICIT:
-        return 
-    import random 
-    sol_chance_low = 1
-    sol_chance_high = 5
-    sol_chance_val = random.randint(sol_chance_low, sol_chance_high)
-    if sol_chance_val == 1:        
-        logger.error(f'WOW! This is annoying!')
-        time.sleep(.5)
-        logger.error('but if you are enjoying this backup solution')
-        time.sleep(.5)
-        logger.error('and you find it reduces your anxiety')
-        time.sleep(.5)
-        logger.error('all while being ridiculously easy to use')
-        time.sleep(.5)
-        logger.info('please consider throwing me a few bucks on PayPal @ timpalko79@yahoo.com')
-        time.sleep(.5)
-        logger.info('that\'s.. timpalko79@yahoo.com!')
-        time.sleep(2)
-        logger.warning('(You can turn this off')
-        logger.warning('by adding no_solicit = true in your FRANKBACK_RC_FILE')
-        logger.warning('or by setting env FRANKBACK_NO_SOLICIT=1)')
+    flag_args, positional_parameters, named_parameters = config.parse_flags()
 
+    b = Backup(config=config, **flag_args)
+    b.parse_command(positional_parameters, named_parameters)
 
 if __name__ == "__main__":
     
-    flag_args, positional_parameters, named_parameters = parse_flags()
-        
-    # logger = FrankLogger(**flag_args)
+    main()
 
-    if not S3_BUCKET or not DATABASE_FILE or not WORKING_FOLDER:
-        logger.error(f'S3_BUCKET, DATABASE_FILE and WORKING_FOLDER must all be provided')
     
-    solicit()
-
-    b = Backup(bucket_name=S3_BUCKET, logger=logger, user_logger=user_logger, **flag_args)
-    b.command(positional_parameters, named_parameters)
     

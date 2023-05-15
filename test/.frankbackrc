@@ -1,0 +1,12 @@
+S3_BUCKET=frankenarchive
+DATABASE_FILE=/opt/frankdb/backups-test.db
+DATABASE_TYPE=sqlite
+DATABASE_USER=bckt
+DATABASE_HOST=127.0.0.1
+DATABASE_NAME=bckt
+DATABASE_PASSWORD=bckt
+IS_NO_SOLICIT=true
+IS_EXCLUDE_VCS_IGNORES=true
+IS_DRY_RUN=false
+WORKING_FOLDER=/media/floor/bcktworking-test
+LOG_FOLDER=./test
