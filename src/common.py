@@ -1,10 +1,22 @@
+import os
+import re
 import subprocess 
 import math
 from enum import Enum 
+from datetime import datetime 
+import traceback 
+import cowpy 
+from pathlib import Path 
+from cache import Cache, CacheType
 
-FOREGROUND_COLOR_PREFIX = '\033[38;2;'
-FOREGROUND_COLOR_SUFFIX = 'm'
-FOREGROUND_COLOR_RESET = '\033[0m'
+# FOREGROUND_COLOR_PREFIX = '\033[38;2;'
+# FOREGROUND_COLOR_SUFFIX = 'm'
+# FOREGROUND_COLOR_RESET = '\033[0m'
+
+home_folder = os.path.expanduser(f'~{os.getenv("USER")}')
+LOCAL_STATS_CACHE_FILE = os.path.join(home_folder, '.bckt-local-stats-cache')
+
+logger = cowpy.getLogger()
 
 class Color(Enum):
     WHITE = 'white' # '255;255;255'
@@ -15,18 +27,18 @@ class Color(Enum):
     DARKGRAY = 'darkgray' # '128;128;128'
     YELLOW = 'yellow' # '165:165:0'
 
-COLOR_TABLE = {
-    'white': '255;255;255',
-    'red': '255;0;0',
-    'green': '0;255;0',
-    'orange': '255;165;0',
-    'gray': '192;192;192',
-    'darkgray': '128;128;128',
-    'yellow': '165:165:0'
-}
+# COLOR_TABLE = {
+#     'white': '255;255;255',
+#     'red': '255;0;0',
+#     'green': '0;255;0',
+#     'orange': '255;165;0',
+#     'gray': '192;192;192',
+#     'darkgray': '128;128;128',
+#     'yellow': '165:165:0'
+# }
 
-def colorwrapper(text, color):
-    return f'{FOREGROUND_COLOR_PREFIX}{COLOR_TABLE[color]}{FOREGROUND_COLOR_SUFFIX}{text}{FOREGROUND_COLOR_RESET}'
+# def colorwrapper(text, color):
+#     return f'{FOREGROUND_COLOR_PREFIX}{COLOR_TABLE[color]}{FOREGROUND_COLOR_SUFFIX}{text}{FOREGROUND_COLOR_RESET}'
 
 # class FrankLogger(object):
     
@@ -120,9 +132,10 @@ def smart_precision(float_value):
     
     # -- a hyphen will indicate the negative exponent of a python-formatted exponentially small number 2e-3 = 0.002 
     if float_value_string.find('-') >= 0:
-        places = float_value_string.split('-')[1]
-        
-    return f'{float_value}:.{places}f'
+        places = float_value_string.split("-")[1]
+    
+    # -- TODO: make this dynamic
+    return f'{float_value:.3f}'
 
 def time_since(minutes):
 
@@ -140,6 +153,36 @@ def time_since(minutes):
 
 def stob(val):
     return str(val).lower() in ['1', 'true', 'yes', 'y']
+
+def _slugify_target_name(target_name):
+    return target_name.replace("/", "_")
+
+def calculate_archive_digest(filename):
+    md5_cmd = "md5sum %s | awk '{ print $1 }'" % filename
+    logger.debug(f'md5sum for {filename}: {md5_cmd}')
+
+    cp = subprocess.run(md5_cmd, text=True, shell=True, capture_output=True)
+    digest = str([ line for line in cp.stdout.splitlines() if line ][0])
+
+    return digest
+
+def generate_archive_target_filename(target, pre_timestamp):
+    return f'{_slugify_target_name(target["name"])}_{datetime.strftime(pre_timestamp, "%Y%m%d_%H%M%S")}.tar.gz'
+
+def archive_filename_match(target_name):
+    return f'.*\/{_slugify_target_name(target_name)}\_[0-9]+_[0-9]+\.tar\.gz'    
+
+def target_name_from_archive_filename(archive_filename):
+    matches = re.findall("(.+)_[0-9]+_[0-9]+\.tar\.gz", archive_filename)
+    if len(matches) > 0:
+        return matches[0]
+    return "-"
+
+def pre_marker_timestamp_from_archive_filename(archive_filename):
+    matches = re.findall(".+_([0-9]+_[0-9]+)\.tar\.gz", archive_filename)
+    if len(matches) > 0:
+        return datetime.strptime(matches[0], "%Y%m%d_%H%M%S")
+    return "-"
 
 def get_folder_free_space(folder):
     '''Folder free space in kilobytes'''
@@ -163,15 +206,141 @@ FREQUENCY_TO_MINUTES = {
 
 def frequency_to_minutes(frequency_value):
     return FREQUENCY_TO_MINUTES[frequency_value]
+
+def get_filesystem_coverage(mount_point, targets):
+
+    # relevant_target_paths = [ t['path'] for t in targets if re.match(f'${mount_point}', t['path']) ]
+
+    target_paths = [ t['path'] for t in targets ]
+
+    for root, dirs, files in os.walk(mount_point):
+
+        dirs_to_remove = []
+        for dir in dirs:
+            # exact matches we don't need to recurse into, they're covered
+            if dir in target_paths:
+                dirs_to_remove.append(dir)
+                continue 
+            
+            possible = False
+            for target_path in target_paths:
+                if re.fullmatch(f'${dir}', target_path):
+                    possible = True
+                    break 
+            if not possible:
+                dirs_to_remove.append(dir)
+
+        for dir in dirs_to_remove:
+            dirs.remove(dir)
+
+
+def get_new_files_since_timestamp(target_name, path, pre_marker_date, no_cache=False):
+
+    logger.info(f'Checking new files for {target_name} at {path} since {pre_marker_date} (no_cache={no_cache})')
+
+    local_stats_cache = Cache(context='local', cache_file=LOCAL_STATS_CACHE_FILE)
+
+    cache_id = local_stats_cache.get_cache_id(CacheType.NewFiles, target_name)
+
+    new_file_output = local_stats_cache.cache_fetch(cache_id)
+
+    if new_file_output is None or no_cache:
+            
+        since_pre_minutes = (datetime.now() - pre_marker_date).total_seconds() / 60.0    
+        
+        logger.info(f'New file check for {target_name} at {path} since {pre_marker_date} is for {since_pre_minutes} minutes ago')
+
+        find_cmd = f'find {path} -type f -mmin -{since_pre_minutes}'
+        # self.logger.debug(find_cmd)
+        cp = subprocess.run(find_cmd.split(' '), check=True, capture_output=True)
+
+        # cp = subprocess.run(f'find {path} -newer {pre_marker}'.split(' '), check=True, capture_output=True)
+
+        new_file_output = cp.stdout.splitlines()
+        new_file_output = [ l.decode('utf-8') for l in new_file_output ]
+        local_stats_cache.cache_store(cache_id, new_file_output)
+
+    return new_file_output 
+
+def get_path_excluded_files(target_name, path, excludes, no_cache=False):
+
+    local_stats_cache = Cache(context='local', cache_file=LOCAL_STATS_CACHE_FILE)
     
-def get_path_uncompressed_size_kb(path, excludes):
+    cache_id = local_stats_cache.get_cache_id(CacheType.ExcludedFiles, target_name)
+
+    flat_excludes = local_stats_cache.cache_fetch(cache_id)
+    
+    if flat_excludes is None or no_cache:
+
+        flat_excludes = []
+
+        if excludes is not None:
+                
+            excludes = [ e for e in excludes.split(':') if e and e.strip() != "" ]
+            this_path = Path(path)
+            
+            exclude_file_map = { e: [] for e in excludes }
+
+            for exclude in excludes:      
+                # logger.debug(f'looking at exclude {exclude}')  
+                for found in this_path.rglob(exclude):
+                    if found.is_dir():
+                        cp = subprocess.run("find \"%s\" -type f" % found, shell=True, text=True, capture_output=True)
+                        exclude_file_map[exclude].extend(cp.stdout.split('\n'))
+                    else:
+                        exclude_file_map[exclude].append(str(found))
+            
+            flat_excludes = [ f for e in exclude_file_map.keys() for f in exclude_file_map[e] if f.strip() != "" ]
+            local_stats_cache.cache_store(cache_id, flat_excludes)
+    
+    return flat_excludes
+
+def get_path_uncompressed_size_kb(target_name, path, excludes, no_cache=False):
+
+    local_stats_cache = Cache(context='local', cache_file=LOCAL_STATS_CACHE_FILE)
 
     # TODO: use target excludes to more accurately compute size
     # TODO: estimate compressed size to more accurately compute size 
-    cp = subprocess.run("du -kd 0 %s | awk '{ print $1 }'" % path, shell=True, text=True, capture_output=True)
+    cp = subprocess.run("du -kxd 0 %s | awk '{ print $1 }'" % path, shell=True, text=True, capture_output=True)
     path_size = int(cp.stdout.replace('\n', ''))
     
-    #excludes = excludes.split(':')
+    cache_id = local_stats_cache.get_cache_id(CacheType.ExcludedSize, target_name)
+
+    excluded_size = local_stats_cache.cache_fetch(cache_id)
+    
+    if excluded_size is None or no_cache:
+
+        if excludes is not None:
+                
+            excludes = [ e for e in excludes.split(':') if e and e.strip() != "" ]
+            this_path = Path(path)
+            
+            exclude_sizes = { e: 0 for e in excludes }
+
+            for exclude in excludes:      
+                logger.debug(f'looking at exclude {exclude}')  
+                for found in this_path.rglob(exclude):
+                    # logger.debug(f'looking at exclude {exclude} -> {found}')
+                    found_excluded_size_bytes = 0
+                    try:
+                        if found.is_dir():
+                            cp = subprocess.run("du -kxd 0 \"%s\" | awk '{ print $1 }'" % found, shell=True, text=True, capture_output=True)                
+                            found_excluded_size_bytes = int(cp.stdout.replace('\n', '')) * 1024
+                        else:
+                            found_stat = found.stat()
+                            found_excluded_size_bytes = int(found_stat.st_size)
+                    except:
+                        logger.exception()
+                    # logger.debug(f'looking at exclude {exclude} -> {found} -> {human(found_excluded_size_bytes, "b")} bytes')
+                    exclude_sizes[exclude] += found_excluded_size_bytes
+                logger.debug(f'{exclude} => {1.0*exclude_sizes[exclude]/(1024*1024*1024):.2f} GB')
+        
+            excluded_size = sum([ exclude_sizes[e] for e in exclude_sizes.keys() ]) / 1024.0
+
+            local_stats_cache.cache_store(cache_id, excluded_size)
+
+    if excluded_size is not None:
+        path_size = path_size - excluded_size
 
     # build:aws_backup/working:thirdparty:*.box:rpi/images:node_modules:clients/riproad:*.log:boxes:minecraft/worlds:minecraft/server/world
     # for path in Path(path).rglob('*'):

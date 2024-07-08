@@ -3,3 +3,5 @@ mariadb
 boto3
 pytz
 ConfigParser
+-e ../../github.com/cowpy
+-e ../frank-common

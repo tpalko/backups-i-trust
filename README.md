@@ -19,6 +19,42 @@ MariaDB [(none)]> grant all privileges on bckt.* to bckt;
 
 ## running development notes
 
+5/3/2024
+
+* include ~/.config/Code/User/History ??
+
+1/8/2024
+
+* extend tar's incremental archive capability and add this as an option per-target
+* per-target option to not remove old archives or set the number of retained archives
+
+1/6/2024 
+
+* `target run TARGET` should match `run` more closely.. operations around actually creating the archive including remote push are missing
+* when making changes to a target that affect cached values, those cached values should clear (excluded files, uncompressed size..)
+* some output going to file should be in stream 
+* `archive list` is not sorted 
+* way too much debug output in file (table print)
+
+
+12/20/2023
+
+* multi-user or machine / single-home or organization 
+* are backups organized by machine or by user
+* backup-aware TF + user-aware TF
+* either bucket-per-user or folder-per-user
+* could have a matrix of machines and users under one organization
+* how to organize TF in a concise way and parameterize from a single source of truth 
+
+12/12/2023
+
+* insert for archives failed for number of arguments, so record is missing but archive exists on local disk. there is some corruption about archive file existence: what is in AWS, what is on disk, what's in the database. the code should self-correct
+* still no remote cleanup active?
+* check bucket transitions for glacier flexible/deep
+* cowpy logger exception() should parse traceback and print through configured handlers, not use print_tb - this is on the stream 
+* scrape local disk, iterate through both this and the s3 remote objects list to identify and label orphans 
+* when orphans are labeled, address appropriately: fill in missing DB records and process normally
+
 5/5/23
 
 target list, need to see:

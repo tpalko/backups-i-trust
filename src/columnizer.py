@@ -74,15 +74,25 @@ class Columnizer(object):
             return 'l'
 
     def _align_table(self, data):
-        return [ [ self._align_spaces(str(r), cell_width=self.tabs[i+1] - self.tabs[i], alignment=self.alignment[i] if self.alignment else self._align_on_type(r)) if i < len(row) else str(r) for i,r in enumerate(row) ] for row in data ]
+        return [ 
+            [ 
+                self._align_spaces(
+                    str(r), 
+                    cell_width=self.tabs[i+1] - self.tabs[i], 
+                    alignment=self.alignment[i] if self.alignment else self._align_on_type(r)
+                ) if i < len(row) 
+                else str(r) 
+                for i,r in enumerate(row) 
+            ] for row in data 
+        ]
 
     # def _table_data(self, table):
     #     return "\n".join([ "\t".join([ str(v) for v in v in row ]) for row in table ])
 
     def _printf_command(self, data, color, highlight_template=None):
         tabs_cmd = f'tabs {",".join([ str(c) for c in self.tabs ])}'
-        print_data = "\n\"; printf \"".join([ colorwrapper("\t".join([ str(v) for v in row ]), color if not (highlight_template and highlight_template[i]) else highlight_template[i].value) for i, row in enumerate(data) ])
-        return "%s; printf \"%s\n\"; %s;" % (tabs_cmd, print_data, self.TAB_STD_INTERVAL)
+        print_data = "\n\"; \n printf \"".join([ colorwrapper("\t".join([ str(v) for v in row ]), color if not (highlight_template and highlight_template[i]) else highlight_template[i].value) for i, row in enumerate(data) ])
+        return f'{tabs_cmd}; printf \"{print_data}\n\";\n{self.TAB_STD_INTERVAL};'
         
     def print(self, table, header, highlight_template=None, data=False, **kwargs):
 
@@ -105,13 +115,37 @@ class Columnizer(object):
         # self.logger.info(self._table_data(table), tabs=self.tabs, color=self.row_color)
         
         self.logger.debug(self.tabs)
-        printout = ""
+        
+        printout_header = ""
         if header and self.headers:
             header = [header]
             header = self._align_table(header)
-            printout += self._printf_command(header, self.header_color)
-        
-        table = self._align_table(table)
-        printout += self._printf_command(table, self.row_color, highlight_template=highlight_template)
+            printout_header = self._printf_command(header, self.header_color)
+            
+            subprocess.run(printout_header, shell=True)
 
-        subprocess.run(printout, shell=True)
+        table = self._align_table(table)
+
+        cursor = 0
+        done = False 
+
+        self.logger.debug(f'columnizer printing table: {table}')
+
+        while True:
+
+            max = cursor + 500
+            if max > len(table):
+                max = len(table)
+                done = True 
+
+            printout = self._printf_command(table[cursor:max], self.row_color, highlight_template=highlight_template)
+
+            self.logger.debug(printout)
+            self.logger.debug(f'total printout length: {len(printout)}')
+
+            subprocess.run(printout, shell=True)
+
+            if done:
+                break 
+
+            cursor += 500

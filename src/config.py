@@ -8,6 +8,7 @@ logger = cowpy.getLogger()
 
 # -- this is the default template to be updated by matching input below 
 # -- it will be passed as keyword args to logging and the main backup class 
+#TODO: keep 'du' commands honest in common.py - we default to one file system, du includes 'x' -- need to make dynamic if we implement a flag
 FLAGS = {
     'quiet': False,
     'headers': True,
@@ -18,7 +19,10 @@ FLAGS = {
     'sort_targets': False,    
     'dry_run': False,    
     'force_push_latest': False,
-    'exclude_vcs_ignores': False
+    'exclude_vcs_ignores': False,
+    'one_file_system': True,
+    'no_cache': False,
+    'ignore_schedule': False
 }
 
 NAMED_PARAMETER_DEFAULTS = {
@@ -36,7 +40,9 @@ FLAGS_OPTIONS = {
     '-v': 'verbose',
     '-s': 'sort_targets',
     '-d': 'dry_run',
-    '-f': 'force_push_latest'
+    '-f': 'force_push_latest',
+    '--no-cache': 'no_cache',
+    '--ignore-schedule': 'ignore_schedule'
 }
 
 # -- input matching these will become keyword args passed to the command
@@ -64,6 +70,7 @@ class Config(object):
         
     is_no_solicit = None 
     is_exclude_vcs_ignores = None 
+    is_one_file_system = None 
     is_dry_run = None 
     
     working_folder = None 
@@ -118,7 +125,7 @@ class Config(object):
             self.__setattr__(k, val)
         
         if not self.cache_filename:
-            self.cache_filename = os.path.join(home_folder, '.bcktcache')
+            self.cache_filename = os.path.join(home_folder, '.bckt-target-cache')
 
         if not self.log_folder:
             self.log_folder = os.path.join(home_folder, 'bcktlog')

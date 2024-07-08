@@ -9,9 +9,10 @@ from contextlib import contextmanager
 from datetime import datetime 
 from pytz import timezone 
 from common import get_path_uncompressed_size_kb, human, frequency_to_minutes, time_since
+from cache import Cache, CacheType
 
 UTC = timezone('UTC')
-CACHE_FILE = f'/tmp/bckt.cache'
+TARGET_CACHE_FILE = f'/tmp/bckt.cache'
 
 REMOTE_STORAGE_COST_GB_PER_MONTH = 0.00099
 
@@ -20,17 +21,15 @@ class PushStrategy(Enum):
     SCHEDULE_PRIORITY = 'schedule_priority'
     CONTENT_PRIORITY = 'content_priority'
 
-class CacheType(Enum):
-    RemoteStats = 0,
-    Archives = 1
-
 class AwsClient:
 
     bucket_name = None 
     db = None 
     logger = None 
+    target_cache = None 
 
     def __init__(self, *args, **kwargs):
+
         if 'bucket_name' not in kwargs or kwargs['bucket_name'] == '':
             raise Exception('bucket_name must be supplied to AwsClient')
         
@@ -42,10 +41,11 @@ class AwsClient:
         self.bucket_name = kwargs['bucket_name']
         self.db = kwargs['db']
         
-        self.cache_file = CACHE_FILE
+        self.cache_file = TARGET_CACHE_FILE
         if 'cache_filename' in kwargs:
             self.cache_file = kwargs['cache_filename'] 
         
+        self.target_cache = Cache(context=self.bucket_name, cache_file=self.cache_file)
 
     @contextmanager
     def archivebucket(self, bucket_name):
@@ -61,10 +61,10 @@ class AwsClient:
     def get_object_storage_cost_per_month(self, size_bytes):
         return REMOTE_STORAGE_COST_GB_PER_MONTH*(size_bytes / (1024 ** 3))
 
-    def is_push_due(self, target, remote_stats=None, print=True):
+    def is_push_due(self, target, remote_stats=None, last_archive=None, aged_archives=0, print=True):
         '''According to the target push strategy, budget, and the objects already remotely stored, could an(y) archive be pushed?'''
         
-        archives = self.db.get_archives(target['name'])
+        archives = self.db.get_archives(target.name)
 
         push_due = False 
         message = 'No calculation was performed to determine push eligibility. The default is no.'
@@ -72,7 +72,7 @@ class AwsClient:
 
         if not remote_stats:
             remote_stats = self.get_remote_stats([target])
-            remote_stats = remote_stats[target['name']]
+            remote_stats = remote_stats[target.name]
             
         last_modified = UTC.localize(datetime.strptime(remote_stats['max_last_modified'], '%c')) if remote_stats['max_last_modified'] else None 
         current_s3_objects = remote_stats['count']
@@ -87,37 +87,43 @@ class AwsClient:
         
         if minutes_since_last_object:
 
-            if target['push_strategy'] == PushStrategy.BUDGET_PRIORITY.value:
+            if target.push_strategy == PushStrategy.BUDGET_PRIORITY.value:
+                
+                max_s3_objects = 0
 
                 average_size = 0
-                max_s3_objects = 0
-                if len(archives) > 0:
-                    average_size = sum([ a['size_kb'] / (1024.0*1024.0) for a in archives ]) / len(archives)
+                if last_archive:
+                    average_size = last_archive['size_kb'] / (1024.0*1024.0)
                 else:
-                    average_size = get_path_uncompressed_size_kb(target['path'], target['excludes']) / (1024.0*1024.0)
+                    if len(archives) > 0:
+                        average_size = sum([ a['size_kb'] / (1024.0*1024.0) for a in archives ]) / len(archives)
+                    else:
+                        # -- yes, we're using uncompressed size to estimate S3 object size in the absence of actual archives to look at, not great
+                        average_size = get_path_uncompressed_size_kb(target.path, target.excludes) / (1024.0*1024.0)
+
                 lifetime_cost = average_size * REMOTE_STORAGE_COST_GB_PER_MONTH * 6
-                max_s3_objects = math.floor(target['budget_max'] / lifetime_cost)
+                max_s3_objects = math.floor(target.budget_max / lifetime_cost)
                 if max_s3_objects == 0:
                     push_due = False 
-                    message = f'One archive has a lifetime cost of {lifetime_cost}. At a max budget of {target["budget_max"]}, no archives can be stored in S3'
+                    message = f'One archive has a lifetime cost of {lifetime_cost}. At a max budget of {target.budget_max}, no archives can be stored in S3'
                 else:
                     minutes_per_push = (180.0*24*60) / max_s3_objects
-                    push_due = current_s3_objects < max_s3_objects and minutes_since_last_object > minutes_per_push
-                    message = f'Given a calculated size of {average_size:.1f} GB and a budget of ${target["budget_max"]:.2f}, a push can be accepted every {time_since(minutes_per_push)} for max {max_s3_objects} objects. It has been {time_since(minutes_since_last_object)} and there are {current_s3_objects} objects.'
+                    push_due = (current_s3_objects - aged_archives) < max_s3_objects and minutes_since_last_object > minutes_per_push
+                    message = f'Given a calculated size of {average_size:.1f} GB and a budget of ${target.budget_max:.2f}, a push can be accepted every {time_since(minutes_per_push)} for max {max_s3_objects} objects. It has been {time_since(minutes_since_last_object)} and there are {current_s3_objects} objects.'
             
-            elif target['push_strategy'] == PushStrategy.SCHEDULE_PRIORITY.value:
+            elif target.push_strategy == PushStrategy.SCHEDULE_PRIORITY.value:
                 
-                frequency_minutes = frequency_to_minutes(target['frequency'])
+                frequency_minutes = frequency_to_minutes(target.frequency)
                 push_due = minutes_since_last_object >= frequency_minutes
-                message = f'The push period is {target["frequency"]} ({frequency_minutes} minutes) and it has been {time_since(minutes_since_last_object)}'
+                message = f'The push period is {target.frequency} ({frequency_minutes} minutes) and it has been {time_since(minutes_since_last_object)}'
             
-            elif target['push_strategy'] == PushStrategy.CONTENT_PRIORITY.value:
+            elif target.push_strategy == PushStrategy.CONTENT_PRIORITY.value:
                 
                 push_due = True 
                 message = f'Content push strategy: any new content justifies remote storage'
                 
             else:
-                message = f'No identifiable push strategy ({target["push_strategy"]}) has been defined for {target["name"]}.'
+                message = f'No identifiable push strategy ({target.push_strategy}) has been defined for {target.name}.'
 
         if print:
             if push_due:
@@ -145,59 +151,6 @@ class AwsClient:
         #   storage_class
         #   wait_until_exists
         #   wait_until_not_exists'
-
-
-
-    @contextmanager
-    def cache(self, read_only=True):
-        
-        contents = {}
-        if not os.path.exists(self.cache_file):
-            with open(self.cache_file, 'w') as f:
-                # self.logger.debug(f'saving {contents}')
-                f.write(json.dumps(contents, indent=4))
-                
-        with open(self.cache_file, 'r') as f:
-            raw_contents = f.read()
-            # self.logger.debug(raw_contents)
-            contents = json.loads(raw_contents)
-            yield contents 
-        if not read_only:
-            with open(self.cache_file, 'w') as f:
-                f.write(json.dumps(contents, indent=4))
-
-    def _get_cache_id(self, cache_type, target_name=None):
-
-        cache_id = f'bucket-${self.bucket_name}'
-
-        if cache_type == CacheType.RemoteStats:
-            cache_id = f'remote-stats_{cache_id}'
-        elif cache_type == CacheType.Archives:
-            cache_id = f'archives_{cache_id}'
-        
-        if target_name:
-            cache_id = f'{cache_id}_target-{target_name}'
-        
-        return cache_id 
-    
-    def _cache_store(self, cache_id, content):
-        with self.cache(read_only=False) as contents:        
-            # self.logger.debug(f'storing {content}')
-            contents[cache_id] = { 'time': datetime.strftime(datetime.utcnow(), '%c'), 'content': content }            
-    
-    def _cache_fetch(self, cache_id):
-        content = None 
-        with self.cache() as contents:
-            if cache_id in contents:
-                content_record = contents[cache_id]
-                if (datetime.utcnow() - datetime.strptime(content_record['time'], '%c')).total_seconds() < 900:
-                    content = content_record['content']
-        return content 
-
-    def _cache_invalidate(self, target_name):
-        with self.cache(read_only=False) as contents:
-            for t in CacheType:
-                del contents[self._get_cache_id(t, target_name)]
 
     def _get_archive_bytes(self, filename):
         b = None 
@@ -229,7 +182,7 @@ class AwsClient:
                     Key=key
                 )
             
-            self._cache_invalidate(target_name)
+            self.target_cache.cache_invalidate(target_name)
 
         return object
 
@@ -253,35 +206,54 @@ class AwsClient:
 
     def _get_remote_stats_for_target(self, target, s3_objects):
 
-        self.logger.debug(f'Fetching remote stats for {target["name"]} / {len(list(s3_objects))} archives')
-        archives_by_last_modified = { datetime.strptime(obj['last_modified'], "%c"): obj['key'] for obj in s3_objects if self._object_is_target(obj, target['name']) }
-            
-        now = UTC.localize(datetime.utcnow())
-        aged = [ archives_by_last_modified[last_modified] for last_modified in archives_by_last_modified if (now - UTC.localize(last_modified)).total_seconds() / (60*60*24) >= 180 ]
-        current_count = len([ last_modified for last_modified in archives_by_last_modified if (now - UTC.localize(last_modified)).total_seconds() / (60*60*24) < 180 ])
+        self.logger.debug(f'Fetching remote stats for {target.name} / {len(list(s3_objects))} archives')
 
+        object_by_last_modified = { datetime.strptime(obj['last_modified'], "%c"): obj for obj in s3_objects if self._object_is_target(obj, target.name) }
+        object_name_by_last_modified = { datetime.strptime(obj['last_modified'], "%c"): obj['key'] for obj in s3_objects if self._object_is_target(obj, target.name) }
+        
+        last_object = None 
+
+        if len(s3_objects) > 0:
+            last_object = object_by_last_modified[max(object_by_last_modified.keys())]
+
+        now = UTC.localize(datetime.utcnow())
+        
+        # -- s3 objects modified before (aged) or after (current) the six month window
+        aged = [ 
+            object_name_by_last_modified[last_modified] 
+            for last_modified in object_name_by_last_modified 
+            if ((now - UTC.localize(last_modified)).total_seconds() / (60*60*24)) >= 180 
+        ]
+        current = [ 
+            object_name_by_last_modified[last_modified]
+            for last_modified in object_name_by_last_modified 
+            if ((now - UTC.localize(last_modified)).total_seconds() / (60*60*24)) < 180 
+        ]
+        
         return { 
-            'max_last_modified': datetime.strftime(max(archives_by_last_modified.keys()), "%c") if len(archives_by_last_modified.keys()) > 0 else None, 
-            'count': len(archives_by_last_modified),
+            'max_last_modified': datetime.strftime(max(object_name_by_last_modified.keys()), "%c") if len(object_name_by_last_modified.keys()) > 0 else None, 
+            'last_size': human(last_object['size'], 'b') if last_object else None,
+            'total': len(object_name_by_last_modified),
+            'current': current,
+            'count': len(current),
             'aged': aged,
-            'current_count': current_count
         }
 
-    def get_remote_stats(self, targets):
+    def get_remote_stats(self, targets, no_cache=False):
         
         remote_stats = {}
 
         for target in targets:
-            cache_id = self._get_cache_id(CacheType.RemoteStats, target["name"])
-            target_stats = self._cache_fetch(cache_id)
-            if not target_stats:
-                target_stats = self._get_remote_stats_for_target(target, self.get_remote_archives(target['name']))
-                self._cache_store(cache_id, target_stats)
-            remote_stats[target['name']] = target_stats
+            cache_id = self.target_cache.get_cache_id(CacheType.RemoteStats, target.name)
+            target_stats = self.target_cache.cache_fetch(cache_id)
+            if not target_stats or no_cache:
+                target_stats = self._get_remote_stats_for_target(target, self.get_remote_archives(target.name))
+                self.target_cache.cache_store(cache_id, target_stats)
+            remote_stats[target.name] = target_stats
 
         return remote_stats 
 
-    def get_remote_archives(self, target_name=None):
+    def get_remote_archives(self, target_name=None, no_cache=False):
             
         # my_config = Config(
         #   region_name = 'us-east-1',
@@ -300,11 +272,11 @@ class AwsClient:
         objects = []
         #print(dir(archive_bucket.objects))
         #print(dir(archive_bucket.objects.all()))
-        cache_id = self._get_cache_id(CacheType.Archives, target_name)
+        cache_id = self.target_cache.get_cache_id(CacheType.Archives, target_name)
         
-        objects = self._cache_fetch(cache_id)
+        objects = self.target_cache.cache_fetch(cache_id)
 
-        if not objects:
+        if not objects or no_cache:
             with self.archivebucket(self.bucket_name) as bucket:            
                 if target_name:
                     objects = bucket.objects.filter(Prefix=f'{target_name}/{target_name}_')
@@ -320,15 +292,15 @@ class AwsClient:
                 'key': obj.key 
             } for obj in objects ]
 
-            self._cache_store(cache_id, objects)
+            self.target_cache.cache_store(cache_id, objects)
 
         return objects 
 
     def cleanup_remote_archives(self, target_name, remote_stats, dry_run=True):
-        if remote_stats['current_count'] > 0:
+        if remote_stats['count'] > 0:
             self.logger.warning(f'Deleting remote archives aged out: {",".join([ key for key in remote_stats["aged"] ])}')
             if dry_run:
                 self.logger.error(f'DRY RUN -- skipping remote deletion')
             else:
                 self._delete_objects(remote_stats["aged"])
-                self._cache_invalidate(target_name)
+                self.target_cache.cache_invalidate(target_name)
