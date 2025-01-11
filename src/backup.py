@@ -17,10 +17,18 @@ from common import smart_precision, get_folder_free_space, calculate_archive_dig
 from config import Config 
 from awsclient import AwsClient 
 from frank.columnizer import Columnizer
+# from bcktdb import BcktDb
+
+from frank.database.init import setup 
+
 from bcktdb import BcktDb
+from models import Run, Archive, Target
+
+os.environ['FRANKDB_MODELS'] = 'models'
+setup() or sys.exit(1)
 
 # -- for DOCDEFER
-from frank.database.database import Database
+# from frank.database.database import Database
 
 MARKER_PLACEHOLDER_TEXT = f'this is a backup timestamp marker. its existence is under the control of {os.path.realpath(__file__)}'
 
@@ -100,7 +108,7 @@ class Backup(object):
             self.log_level = kwargs['log_level']
             del kwargs['log_level']
 
-        self._set_log_level()
+        self._create_loggers()
 
         for k in kwargs:
             self.logger.debug(f'kwarg: {k} => {kwargs[k]}')
@@ -111,14 +119,14 @@ class Backup(object):
         
         self.solicit()
 
-        self.db = BcktDb(config=self.config, user_logger=self.user_logger)
-        self.awsclient = AwsClient(bucket_name=self.config.s3_bucket, db=self.db, cache_filename=self.config.cache_filename)
+        self.db = BcktDb(user_logger=self.user_logger)
+        self.awsclient = AwsClient(bucket_name=self.config.s3_bucket, cache_filename=self.config.cache_filename)
         self.columnizer = Columnizer(**kwargs)
         
         self.command = []
         self.command_context = self.command_index() 
     
-    def _set_log_level(self, log_level=None):     
+    def _create_loggers(self, log_level=None):     
         if log_level is None:
             log_level = self.log_level           
         self.logger = cowpy.getLogger(name='bckt')
@@ -155,7 +163,7 @@ class Backup(object):
                 '_help': 'Database activities',
                 'init': self.initialize_database,
                 'repair': self.db_repair,
-                'writeout': self.db.dump
+                # 'writeout': self.db.dump
             },
             'info': self.print_header,
             'target': {
@@ -284,7 +292,7 @@ class Backup(object):
                 for p in global_parameters.keys():
                     self.logger.debug(f'command parsing setting instance parameter: {p} -> {global_parameters[p]}')
                     if p == "log_level":
-                        self._set_log_level(log_level=global_parameters[p])
+                        self._create_loggers(log_level=global_parameters[p])
                     else:
                         self.__setattr__(p, global_parameters[p])
 
@@ -306,13 +314,11 @@ class Backup(object):
         '''
         Print information regarding the current environment
         '''
-        self.user_logger.info(f'\n\n\
-Date:\t\t{datetime.now()}\n\
-User:\t\t{os.getenv("USER", "unknown")}\n\
-Command:\t{" ".join(sys.argv)}\n\
-Working folder:\t{self.config.working_folder}\n\
-Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f} GB\n\
-')
+        self.user_logger.info(f'Date:\t\t{datetime.now()}')
+        self.user_logger.info(f'User:\t\t{os.getenv("USER", "unknown")}')
+        self.user_logger.info(f'Command:\t{" ".join(sys.argv)}')
+        self.user_logger.info(f'Working folder:\t{self.config.working_folder}')
+        self.user_logger.info(f'Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f} GB')
     
     def confirm(self, msg):
         self.user_logger.info(msg)
@@ -320,13 +326,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
         return user_response == 'y'
 
     def targets(self, target_name=None):
-         targets = []         
-         if target_name:
-             target = self.db.get_target(name=target_name)
-             if target:
-                 targets.append(target)
-         else:
-             targets = self.db.get_targets()
+         targets = [Target.only(name=target_name)] if target_name else Target.all()
          
          self.logger.debug(f'fetching remote stats on {len(targets)} targets')
          remote_stats = self.awsclient.get_remote_stats(targets)
@@ -355,33 +355,37 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
             self.user_logger.info(f'Not creating {target_name}..')
 
     def target_info(self, target_name):
-        target = self.db.get_target(name=target_name)
+        target = Target.only(name=target_name)
         self.logger.debug(target)        
         remote_stats = self.awsclient.get_remote_stats([target], no_cache=self.no_cache)
-        for k in target.keys():
-            val = target[k]
-            if k == "excludes":
+        for col in target._instancemeta.user_cols:
+            val = getattr(target, col['name'])
+            if col['name'] == 'excludes':
                 if self.verbose:
                     val = val.split(':')
-            self.user_logger.info(f'{k}: {val}')
+            self.user_logger.info(f'{col["name"]}: {val}')
         remote_stats = { 'remote_stats': remote_stats }
         self.user_logger.info(json.dumps(remote_stats, indent=4))
         local_stats = { 'local_stats': {} }
         local_stats['local_stats']['has_new_files'] = self.target_has_new_files(target, log=False)
-        local_stats['local_stats']['uncompressed_size'] = human(get_path_uncompressed_size_kb(target_name, target['path'], excludes=target['excludes'], no_cache=self.no_cache), 'kb', )
+        local_stats['local_stats']['uncompressed_size'] = human(get_path_uncompressed_size_kb(target_name, target.path, excludes=target.excludes, no_cache=self.no_cache), 'kb', )
         self.user_logger.info(json.dumps(local_stats, indent=4))
 
-    def edit_target(self, target_name, frequency=None, budget=None, path=None, excludes=None):
+    def edit_target(self, target_name, **kwargs): #frequency=None, budget=None, path=None, excludes=None):
         '''Sets target parameters'''
 
-        if frequency is not None:
+        if 'frequency' in kwargs:
             frequency_choices = [ m.lower() for m in Frequency.__members__ ]
-            if frequency not in frequency_choices:
-                raise Exception(f'"{frequency}" is not a valid frequency (choose: {",".join(frequency_choices)})')
+            if 'frequency' not in frequency_choices:
+                raise Exception(f'"{kwargs["frequency"]}" is not a valid frequency (choose: {",".join(frequency_choices)})')
 
         # excludes = ":".join([ kwargs[k] for k in kwargs if k == "excludes" and kwargs[k][0] == "+" ]) or None 
-                
-        self.db.update_target(target_name, frequency=frequency, budget_max=budget, excludes=excludes, path=path)
+
+        Target.upsert_only(on__name=target_name, **kwargs) #frequency=frequency, budget_max=budget, excludes=excludes, path=path)
+
+        # target = Target.only(name=target_name)
+        # target.upsert(frequency=frequency, budget_max=budget, excludes=excludes, path=path)                
+        # self.db.update_target(target_name, frequency=frequency, budget_max=budget, excludes=excludes, path=path)
         self.target_info(target_name)
 
     def pause_target(self, target_name):
@@ -397,7 +401,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
         os.unlink(self.get_marker_path(target, 'post'))
 
     def get_marker_path(self, target, place):
-        return os.path.join(os.path.realpath(os.path.join(target['path'], '..')), f'{target["name"]}_{place}_backup_marker')
+        return os.path.join(os.path.realpath(os.path.join(target.path, '..')), f'{target.name}_{place}_backup_marker')
 
     def recreate_marker_file(self, marker_path, timestamp=None):
         if not os.path.exists(marker_path):
@@ -425,7 +429,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
 
         try:
             
-            pre_marker_date = target["pre_marker_at"]
+            pre_marker_date = target.pre_marker_at
 
             if not pre_marker_date:
                 if log:
@@ -437,10 +441,10 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
                     pre_marker_stat = shutil.os.stat(pre_marker_file)            
                     pre_marker_date = datetime.fromtimestamp(pre_marker_stat.st_mtime)
 
-                if pre_marker_date and not target["pre_marker_at"]:
+                if pre_marker_date and not target.pre_marker_at:
                     if log:
                         self.user_logger.debug(f'updating target pre-marker at {pre_marker_date}')
-                    self.db.update_target(target["name"], pre_marker_at=pre_marker_date)
+                    self.db.update_target(target.name, pre_marker_at=pre_marker_date)
                     if log:
                         self.user_logger.debug(f'removing marker files')
                     self.remove_marker_files(target)
@@ -450,20 +454,20 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
                 pre_marker_stamp = datetime.strftime(pre_marker_date, "%c")
 
                 # -- verify an archive actually exists corresponding to this pre-marker file
-                marker_archive = self.db.get_archive_for_pre_timestamp(target['id'], pre_marker_date)
+                marker_archive = self.db.get_archive_for_pre_timestamp(target.id, pre_marker_date)
                 if not marker_archive:
                     if log:
                         self.user_logger.warning(f'No archive exists corresponding to the existing pre-marker {pre_marker_stamp}. This marker is invalid, and all files are considered new.')
                     has_new_files = True 
                 else:
 
-                    new_file_output = get_new_files_since_timestamp(target['name'], target['path'], pre_marker_date, no_cache=self.no_cache)
+                    new_file_output = get_new_files_since_timestamp(target.name, target.path, pre_marker_date, no_cache=self.no_cache)
                     if log:
                         # self.user_logger.debug(f'new files: {json.dumps(new_file_output, indent=4)}')
                         self.user_logger.debug(f'new files: {len(new_file_output)}')
                     all_changed_file_count = len(new_file_output)
 
-                    excluded_files = get_path_excluded_files(target['name'], target['path'], target['excludes'], no_cache=self.no_cache)
+                    excluded_files = get_path_excluded_files(target.name, target.path, target.excludes, no_cache=self.no_cache)
                     if log:
                         # self.user_logger.debug(f'excluded files: {json.dumps(excluded_files, indent=4)}')
                         self.user_logger.debug(f'excluded files: {len(excluded_files)}')
@@ -507,7 +511,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
         if target:
             targets = [target]
         else:
-            targets = self.db.get_targets()
+            targets = Target.all()
         
         archives = self.get_archives()
 
@@ -588,7 +592,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
             honors budget constraints for remote storage
         '''
         
-        target = self.db.get_target(name=target_name)
+        target = Target.only(name=target_name)
         
         if not results:
             results = Results()
@@ -902,7 +906,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
             if target_name:
                 self.logger.debug(f'fetching target by name {target_name}')
 
-                target = self.db.get_target(name=target_name)
+                target = Target.only(name=target_name)
 
                 if target:
 
@@ -941,7 +945,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
 
             if target_name:
                     
-                target = self.db.get_target(name=target_name)
+                target = Target.only(name=target_name)
 
                 if target:
 
@@ -970,7 +974,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
 
         self.logger.debug(f'getting archives for {target_name}')
         
-        targets = self.db.get_targets()
+        targets = Target.all()
 
         targets_by_id = { t.id: t for t in targets }
 
@@ -1018,25 +1022,28 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
             is_scheduled = True 
         return is_scheduled
     
-    def get_blank_target(self):
-        return {
-            'name': '-',
-            'is_active': '-',
-            'path': '-',
-            'excludes': '-',
-            'uncompressed_kb': '-',
-            'last_archive_size': '-',
-            'frequency': '-',
-            'cycles_behind': '-',
-            'last_archive_at': '-',
-            'has_new_files': '-',
-            'would_push': '-',
-            'push_strategy': '-',
-            'monthly_cost': '-',
-            'budget_max': '-',
-            'local_archive_count': '-',
-            'remote_archive_count': '-'
-        }
+    def get_blank_target(self, target):
+
+        attrs = [
+            'name',
+            'is_active',
+            'path',
+            'excludes',
+            'uncompressed_kb',
+            'last_archive_size',
+            'frequency',
+            'cycles_behind',
+            'last_archive_at',
+            'has_new_files',
+            'would_push',
+            'push_strategy',
+            'monthly_cost',
+            'budget_max',
+            'local_archive_count',
+            'remote_archive_count',
+        ]
+
+        return { a: getattr(target, a) if hasattr(target, a) else '-' for a in attrs }                    
 
     def _is_archive_local(self, archive_location):
         return archive_location in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY, Location.LOCAL_ONLY_ORPHAN, Location.LOCAL_AND_REMOTE_ORPHAN, Location.LOCAL_REMOTE_UNKNOWN, Location.LOCAL_ONLY_ORPHAN_REMOTE_UNKNOWN ]
@@ -1058,19 +1065,19 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
         archives_by_target_and_location = {}
         total_last_archive_size_kb = 0
 
-        for target_print_item, remote_stats in self.targets(target_name):
+        for target, remote_stats in self.targets(target_name):
             
             # -- target name, path, budget max, frequency, total archive count, % archives remote, last archive date/days, next archive date/days
             time_out = datetime.now()
-            archives = self.get_archives(target_print_item.name)
+            archives = self.get_archives(target.name)
             time_in = datetime.now()
             self.logger.debug(f'archive fetch time: {"%.1f" % (time_in - time_out).total_seconds()} seconds')
 
-            if target_print_item.id not in archives_by_target_and_location:
-                archives_by_target_and_location[target_print_item.id] = {'local': [], 'remote': [] }
+            if target.id not in archives_by_target_and_location:
+                archives_by_target_and_location[target.id] = {'local': [], 'remote': [] }
             
-            archives_by_target_and_location[target_print_item.id]['local'] = [ a for a in archives if self._is_archive_local(a['location']) ]
-            archives_by_target_and_location[target_print_item.id]['remote'] = [ a for a in archives if self._is_archive_remote(a['location']) ]
+            archives_by_target_and_location[target.id]['local'] = [ a for a in archives if self._is_archive_local(a['location']) ]
+            archives_by_target_and_location[target.id]['remote'] = [ a for a in archives if self._is_archive_remote(a['location']) ]
 
             # for archive in archives:
             #     if archive['location'] in [ Location.LOCAL_AND_REMOTE, Location.LOCAL_ONLY ]:
@@ -1079,57 +1086,49 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
             #         archives_by_target_and_location[archive['target_id']]['remote'].append(archive)
                     
             # target_print_item = copy.copy(target)
+            target_print_item = self.get_blank_target(target)
 
-            self.logger.debug(f'analyzing {target_print_item.name}')
+            self.logger.debug(f'analyzing {target.name}')
             
-            target_print_item.has_new_files = '-'
+            if self.show_has_new_files and target.is_active:
+                target_print_item['has_new_files'] = self.target_has_new_files(target, log=True)
 
-            if self.show_has_new_files and target_print_item.is_active:
-                target_print_item.has_new_files = self.target_has_new_files(target_print_item, log=True)
-
-            target_archives_by_created_at = { a['pre_marker_timestamp']: a for a in archives if a['target_id'] == target_print_item.id }
-            
-            target_print_item.last_archive_at = '-'
-            target_print_item.last_archive_pushed = '-'
-            target_print_item.last_archive_size = '-'
-            target_print_item.cycles_behind = '-'
-            target_print_item.would_push = '-'
-            target_print_item.uncompressed_kb = '-'
+            target_archives_by_created_at = { a['pre_marker_timestamp']: a for a in archives if a['target_id'] == target.id }
             
             # -- if no archives, we set some defaults and skip the remaining analysis 
             if len(target_archives_by_created_at) == 0:
-                target_print_item.last_archive_pushed = 'n/a'
-                if self.show_would_push and target_print_item.is_active:
-                    target_print_item.would_push = target_print_item.has_new_files
+                target_print_item['last_archive_pushed'] = 'n/a'
+                if self.show_would_push and target.is_active:
+                    target_print_item['would_push'] = target_print_item['has_new_files']
             else:
                 last_archive_created_at = max(target_archives_by_created_at.keys())
                 last_archive = target_archives_by_created_at[last_archive_created_at]
                 
-                target_print_item.cycles_behind = 0
-                frequency = target_print_item.frequency
+                target_print_item['cycles_behind'] = 0
+                frequency = target.frequency
                 minutes_since_last_archive = (now - last_archive['pre_marker_timestamp']).total_seconds() / 60.0
                 
                 frequency_minutes = frequency_to_minutes(frequency)
                 if frequency_minutes != 0:            
-                    target_print_item.cycles_behind = math.floor(minutes_since_last_archive / frequency_minutes)
+                    target_print_item['cycles_behind'] = math.floor(minutes_since_last_archive / frequency_minutes)
 
-                target_print_item.last_archive_at = time_since(minutes_since_last_archive)
-                target_print_item.last_archive_pushed = last_archive['is_remote']
-                target_print_item.last_archive_size = "%.2f" % (last_archive['size_kb'] / (1024*1024))
+                target_print_item['last_archive_at'] = time_since(minutes_since_last_archive)
+                target_print_item['last_archive_pushed'] = last_archive['is_remote']
+                target_print_item['last_archive_size'] = "%.2f" % (last_archive['size_kb'] / (1024*1024))
                 total_last_archive_size_kb += last_archive['size_kb']
             
             
-            if self.show_would_push and target_print_item.is_active:
-                push_due = self.awsclient.is_push_due(target_print_item, remote_stats=remote_stats, print=False)
-                target_print_item.would_push = push_due and (not target_print_item.last_archive_pushed or target_print_item.has_new_files)
-            if self.show_size_on_disk and target_print_item.is_active:
-                target_print_item.uncompressed_kb = get_path_uncompressed_size_kb(target_print_item.name, target_print_item.path, target_print_item.excludes, no_cache=self.no_cache)
+            if self.show_would_push and target.is_active:
+                push_due = self.awsclient.is_push_due(target, remote_stats=remote_stats, print=False)
+                target_print_item['would_push'] = push_due and (not target_print_item['last_archive_pushed'] or target_print_item['has_new_files'])
+            if self.show_size_on_disk and target.is_active:
+                target_print_item['uncompressed_kb'] = get_path_uncompressed_size_kb(target.name, target.path, target.excludes, no_cache=self.no_cache)
 
-            target_print_item.local_archive_count = len(archives_by_target_and_location[target_print_item.id]['local'])
-            target_print_item.remote_archive_count = len(archives_by_target_and_location[target_print_item.id]['remote'])
-            target_storage_cost_sum = sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target_print_item.id]['remote'] ])
-            self.logger.debug(f'{target_print_item.name} storage cost sum: {target_storage_cost_sum}')
-            target_print_item.monthly_cost = smart_precision(target_storage_cost_sum)
+            target_print_item['local_archive_count'] = len(archives_by_target_and_location[target.id]['local'])
+            target_print_item['remote_archive_count'] = len(archives_by_target_and_location[target.id]['remote'])
+            target_storage_cost_sum = sum([ self.awsclient.get_object_storage_cost_per_month(a['size_kb']*1024) for a in archives_by_target_and_location[target.id]['remote'] ])
+            self.logger.debug(f'{target.name} storage cost sum: {target_storage_cost_sum}')
+            target_print_item['monthly_cost'] = smart_precision(target_storage_cost_sum)
 
             target_print_items.append(target_print_item)
                 
@@ -1467,7 +1466,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
 
         target = None 
         if target_name:
-            target = self.db.get_target(name=target_name)
+            target = Target.only(name=target_name)
 
         self.cleanup_local_archives(target=target, aggressive=False, dry_run=self.dry_run)
     
@@ -1475,7 +1474,7 @@ Free space: \t{get_folder_free_space(self.config.working_folder)/(1024*1024):.0f
 
         target = None 
         if target_name:
-            target = self.db.get_target(name=target_name)
+            target = Target.only(name=target_name)
 
         self.cleanup_local_archives(target=target, aggressive=True, dry_run=self.dry_run)
 

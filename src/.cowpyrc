@@ -1,47 +1,21 @@
 {
-    'formatters': {
-        'user': {
-            'level': 'DEBUG',
-            'format': '%(message)s'
-        },        
-    },
     'handlers': {
-        'console': {
-            'class': 'logging.StreamHandler',
-            'format': 'Format.DETAILED',
-            'level': 'DEBUG'
-        },        
-        'user_console': {
-            'class': 'logging.StreamHandler',
-            'formatter': 'user',
-            'level': 'DEBUG'
-        },        
-        'user_exception_handler': {
-            'class': 'logging.FileHandler',
-            'filename': './test/bckt.err',
-            'level': 'ERROR',
-            "format": "Format.DETAILED"
-        },
-        'user_internal_logger': {
-            'class': 'logging.FileHandler',
-            'filename': './test/bckt.log',
-            'level': 'WARN'            
-        },
         'exception_handler': {
             'class': 'logging.FileHandler',
-            'filename': './test/bckt.err',
+            'filename': './logs/bckt_exceptions.log',
             'level': 'WARNING',
             "format": "Format.DETAILED"
         },
         'internal_logger': {
             'class': 'logging.FileHandler',
-            'filename': './test/bckt.log',
+            'filename': './logs/bckt.log',
             'level': 'DEBUG'            
         },
-    },
-    'root': {
-        'handlers': ['console'],
-        'level': 'DEBUG',
+        'user_console': {
+            'class': 'logging.StreamHandler',
+            'format': 'Format.USER',
+            'level': 'DEBUG'
+        },
     },
     'loggers': {    
         'urllib3': {
@@ -50,21 +24,27 @@
         },
         'botocore': {
             'handlers': ['internal_logger', 'exception_handler'],
-            'level': 'DEBUG',
+            'level': 'INFO',
         },
         'boto3': {
             'handlers': ['internal_logger', 'exception_handler'],
-            'level': 'DEBUG',
+            'level': 'INFO',
         },
         's3transfer': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
         },
-        'common': {
+        'database': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
+            'force': 'True'
         },
-        'database': {
+        'model': {
+            'handlers': ['internal_logger', 'exception_handler'],
+            'level': 'DEBUG',
+            'force': 'True'
+        },
+        'common': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
         },
@@ -73,6 +53,10 @@
             'level': 'DEBUG',
         },
         'awsclient': {
+            'handlers': ['internal_logger', 'exception_handler'],
+            'level': 'DEBUG',
+        },
+        'init': {
             'handlers': ['internal_logger', 'exception_handler'],
             'level': 'DEBUG',
         },
@@ -89,7 +73,7 @@
             'level': 'DEBUG',
         },        
         'user': {
-            'handlers': ['user_console', 'user_internal_logger', 'user_exception_handler'],
+            'handlers': ['user_console'],
             'level': 'DEBUG',
         }
     }

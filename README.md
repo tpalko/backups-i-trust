@@ -13,7 +13,7 @@
 
 ### database 
 
-MariaDB [(none)]> create user if not exists bckt identified by 'bckt';
+MariaDB [(none)]> create user if not exists bckt identified by '6uck37';
 MariaDB [(none)]> create database if not exists bckt;
 MariaDB [(none)]> grant all privileges on bckt.* to bckt;
 

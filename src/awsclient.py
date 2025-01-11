@@ -8,8 +8,10 @@ import base64
 from contextlib import contextmanager
 from datetime import datetime 
 from pytz import timezone 
+
 from common import get_path_uncompressed_size_kb, human, frequency_to_minutes, time_since
 from cache import Cache, CacheType
+from models import Archive
 
 UTC = timezone('UTC')
 TARGET_CACHE_FILE = f'/tmp/bckt.cache'
@@ -24,7 +26,6 @@ class PushStrategy(Enum):
 class AwsClient:
 
     bucket_name = None 
-    db = None 
     logger = None 
     target_cache = None 
 
@@ -33,13 +34,9 @@ class AwsClient:
         if 'bucket_name' not in kwargs or kwargs['bucket_name'] == '':
             raise Exception('bucket_name must be supplied to AwsClient')
         
-        if 'db' not in kwargs or not kwargs['db']:
-            raise Exception('db must be supplied to AwsClient')
-        
         self.logger = cowpy.getLogger()
         
         self.bucket_name = kwargs['bucket_name']
-        self.db = kwargs['db']
         
         self.cache_file = TARGET_CACHE_FILE
         if 'cache_filename' in kwargs:
@@ -64,7 +61,7 @@ class AwsClient:
     def is_push_due(self, target, remote_stats=None, last_archive=None, aged_archives=0, print=True):
         '''According to the target push strategy, budget, and the objects already remotely stored, could an(y) archive be pushed?'''
         
-        archives = self.db.get_archives(target.name)
+        archives = Archive.get(name=target.name)
 
         push_due = False 
         message = 'No calculation was performed to determine push eligibility. The default is no.'

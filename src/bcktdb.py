@@ -7,8 +7,13 @@ import sqlite3
 import mariadb
 from contextlib import contextmanager
 import subprocess
-from frank.database.database import Database
-from frank.database.model import BaseModel, JsonColumn, StringColumn, IntColumn, FloatColumn, BoolColumn, DateTimeColumn
+
+# os.environ['FRANKDB_SETTINGS'] = 'settings'
+# from frank.database.init import setup
+
+from models import Target, Archive
+
+# setup()
 
 DBCONFIG = {    
     'base': {
@@ -116,36 +121,6 @@ TARGETS_SELECT = 't.id, t.path, t.name, t.excludes, t.budget_max, t.frequency, t
 #         c.db_password = password 
 #         c.db_user = user 
 #         return c    
-
-class Run(BaseModel):
-    start_at = DateTimeColumn()
-    end_at = DateTimeColumn()
-    run_stats_json = JsonColumn()
-
-class Archive(BaseModel):
-    target_id = IntColumn()
-    size_kb = IntColumn()
-    is_remote = BoolColumn()
-    remote_push_at = DateTimeColumn()
-    filename = StringColumn()
-    returncode = IntColumn()
-    errors = StringColumn()
-    pre_marker_timestamp = DateTimeColumn()
-    md5 = StringColumn()
-    uncompressed_size_kb = IntColumn()
-
-class Target(BaseModel):
-    path = StringColumn()
-    name = StringColumn()
-    excludes = StringColumn()
-    budget_max = FloatColumn()
-    frequency = StringColumn()
-    push_strategy = StringColumn()
-    push_period = IntColumn()
-    is_active = BoolColumn()
-    pre_marker_at = DateTimeColumn()
-    post_marker_at = DateTimeColumn()
-    last_reason = StringColumn()
     
 class BcktDb(object):
 
@@ -164,13 +139,8 @@ class BcktDb(object):
 
         # dbConfig = DatabaseConfig.New(host=kwargs['host'], user=kwargs['user'], password=kwargs['password'], name=kwargs['database'])
 
-        self.config = kwargs['config']
         self.user_logger = kwargs['user_logger']
-
-        self.logger.debug(self.config)
         
-        Database.createInstance(config={'filename': self.config.database_file, 'dbType': self.config.database_type})
-
         # self.sqliteDb = Database(
         #     config=DatabaseConfig.NewSqlite(
         #         filename=self.config.database_file             
@@ -262,9 +232,9 @@ class BcktDb(object):
     #             raise BcktDatabaseException(sys.exc_info()[1])
     ### CUT ^^^ 
     
-    def dump(self):
-        '''DOCDEFER:Database.dump'''
-        return self.sqliteDb.dump()
+    # def dump(self):
+    #     '''DOCDEFER:Database.dump'''
+    #     return self.sqliteDb.dump()
 
     def init(self):
         '''DOCDEFER:Database.init_db'''        
@@ -332,13 +302,15 @@ class BcktDb(object):
         
         target = None 
         if target_name:
-            target = self.get_target(target_name)
+            target = Target.get(name=target_name)
 
         self.logger.debug(f'getting archives for target: {target}')
 
         resp = {}
 
         if target:
+            #join(Target, on_col=Archive.target_id).
+            return Archive.get(target_id=target[0].id)
             resp = self.sqliteDb._select('archives', joins=['targets'], join_cols=False, where={'a.target_id': target['id']}, order_by='a.created_at desc')
             # c.execute(f'select {ARCHIVE_TARGET_JOIN_SELECT} {ARCHIVE_TARGET_JOIN} where a.target_id = ? order by created_at desc', (target['id'],))
         else:
@@ -389,28 +361,22 @@ class BcktDb(object):
         return insert_id
 
     def get_targets(self):
-        fake_target = Target()
         return Target.all()
         # resp = self.sqliteDb._select('targets')
         # return resp['data']        
-
-    def get_target(self, name):
-        return Target.get(name=name)
-        # resp = self.sqliteDb._select('targets', where={'t.name': name})
-        # if len(resp['data']) > 0:
-        #     return resp['data'][0]
-        # return None 
-
+    
     def create_target(self, path, name, frequency, budget, excludes, is_active=True, push_strategy=PushStrategy.BUDGET_PRIORITY):
         '''Creates a new target'''
-        existing_target = self.get_target(name)
+        existing_target = Target.get(name=name)
         if not existing_target:
             # -- if enum, use value 
-            if type(push_strategy).__name__ == 'PushStrategy':
+            if type(push_strategy) == PushStrategy:
                 push_strategy = push_strategy.value 
+            new_target = Target(path=path, name=name, excludes=excludes, budget=budget, frequency=frequency, push_strategy=push_strategy, is_active=is_active)
+            new_target.upsert()
             #path, name, excludes, budget_max, frequency, push_strategy, push_period, is_active, pre_marker_at, post_marker_at, last_reason, created_at
-            params = (path, name, excludes, budget, frequency, push_strategy, "", is_active, None, None, None, datetime.now())
-            self.sqliteDb._insert('targets', *params)
+            # params = (path, name, excludes, budget, frequency, push_strategy, "", is_active, None, None, None, datetime.now())
+            # self.sqliteDb._insert('targets', *params)
             self.logger.success(f'Target {name} added')                
         else:
             self.logger.warning(f'Target {name} already exists')
@@ -423,8 +389,9 @@ class BcktDb(object):
         # setters = ','.join([ f'{k} = ?' for k in kwargs if kwargs[k] is not None ])
         # vals = [ kwargs[k] for k in kwargs if kwargs[k] is not None ]
 
-        target = self.get_target(name=target_name)
-        self.sqliteDb._update('targets', set=kwargs, where={'id': target['id']})
+        target = Target.only(name=target_name)
+        target.upsert(**kwargs)
+        # self.sqliteDb._update('targets', set=kwargs, where={'id': target['id']})
 
         # with self.cursor() as c:
         #     c.execute(f'select {TARGETS_SELECT} from targets t where t.name = ?', (target_name,))
@@ -443,7 +410,7 @@ class BcktDb(object):
     #             self.conn.commit()
 
     def set_target_last_reason(self, target_name, last_reason):        
-        target = self.get_target(target_name)
+        target = Target.get(name=target_name)
         self.logger.warning(f'setting target last reason for {target}')
         resp = self.sqliteDb._update('targets', {'last_reason': last_reason.value}, {'id': target['id']})
         
